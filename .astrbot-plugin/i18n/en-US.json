@@ -1,0 +1,69 @@
+{
+  "metadata": {
+    "display_name": "Group Agent Flow",
+    "desc": "Snapshot-driven autonomous QQ group agent with tool-only external actions and pluggable context renderers."
+  },
+  "config": {
+    "agent_settings": {
+      "description": "Agent settings",
+      "enabled": {
+        "description": "Enable autonomous group observation"
+      },
+      "authorized_group_ids": {
+        "description": "QQ groups allowed to run the agent",
+        "hint": "Leave empty to disable autonomous runs. Add QQ group IDs as strings; * enables every group."
+      }
+    },
+    "scheduling": {
+      "description": "Snapshot scheduling",
+      "debounce_seconds": {
+        "description": "Quiet delay for normal messages (seconds)"
+      },
+      "direct_delay_seconds": {
+        "description": "Quiet delay for directed messages (seconds)"
+      },
+      "min_cycle_interval_seconds": {
+        "description": "Minimum reasoning cycle interval (seconds)"
+      }
+    },
+    "context": {
+      "description": "Persisted context and rendering",
+      "renderer": {
+        "description": "Context renderer for newly assigned conversations",
+        "hint": "Aggregated Delta Block (Dash-separated) uses one user message wrapped in <group_messages_delta> with --- separators; Aggregated Delta Block (Line-separated) joins structured event lines with newlines; Dedicated User Block per Message creates a separate role=user block for each event.",
+        "labels": ["Aggregated Delta Block (Dash-separated)", "Aggregated Delta Block (Line-separated)", "Dedicated User Block per Message"]
+      },
+      "max_messages_per_cycle": {
+        "description": "Maximum new messages per cycle",
+        "hint": "0 keeps the complete unconsumed delta. Older messages remain searchable through history tools."
+      },
+      "max_log_records": {
+        "description": "Maximum persisted records per group",
+        "hint": "0 disables retention trimming."
+      },
+      "max_text_chars": {
+        "description": "Maximum stored text length per message"
+      },
+      "record_self_messages": {
+        "description": "Record messages sent by the bot account",
+        "hint": "Enabled bot echo events can enter later snapshots and start another reasoning cycle."
+      },
+      "record_empty_messages": {
+        "description": "Record messages with no text or components",
+        "hint": "Contentless transport events are retained for diagnostics and skipped before model inference."
+      }
+    },
+    "prompt": {
+      "description": "Agent prompt",
+      "custom_system_prompt": {
+        "description": "Additional persona or group behavior instructions"
+      }
+    },
+    "debug": {
+      "description": "Diagnostics",
+      "debug_log": {
+        "description": "Log snapshot preparation details"
+      }
+    }
+  }
+}

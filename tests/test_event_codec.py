@@ -1,0 +1,95 @@
+from types import SimpleNamespace
+
+from astrbot.api import message_components as Comp
+
+from event_codec import extract_group_event
+
+
+class FakeEvent:
+    def __init__(self):
+        self.message_obj = SimpleNamespace(
+            message_id="msg-200",
+            timestamp=1783836222,
+            group=SimpleNamespace(group_name="测试群"),
+        )
+        self._messages = [
+            Comp.Reply(id="msg-199", sender_id="10000", message_str="上一条"),
+            Comp.At(qq="7", name="Bot"),
+            Comp.Plain("正文"),
+            Comp.Image(file="https://example.com/image.jpg"),
+        ]
+
+    def get_platform_id(self):
+        return "NapCat-7"
+
+    def get_platform_name(self):
+        return "aiocqhttp"
+
+    def get_group_id(self):
+        return "1"
+
+    def get_sender_id(self):
+        return "10001"
+
+    def get_sender_name(self):
+        return "Alice"
+
+    def get_self_id(self):
+        return "7"
+
+    def get_messages(self):
+        return self._messages
+
+    def get_message_outline(self):
+        return "[引用消息] [At:Bot] 正文 [图片]"
+
+    def get_message_str(self):
+        return "正文"
+
+
+def test_extract_group_event_preserves_routing_and_reply_metadata():
+    record = extract_group_event(FakeEvent(), max_text_chars=4000)
+
+    assert record["schema_version"] == 2
+    assert record["flow_id"] == "NapCat-7:group:1"
+    assert record["message_id"] == "msg-200"
+    assert record["reply_to"] == "msg-199"
+    assert record["is_directed_at_bot"] is True
+    assert record["text"] == "[引用消息] [At:Bot] 正文 [图片]"
+
+
+def test_extract_group_event_serializes_supported_components():
+    record = extract_group_event(FakeEvent(), max_text_chars=4000)
+
+    assert record["components"] == [
+        {"type": "reply", "message_id": "msg-199", "sender_id": "10000"},
+        {"type": "at", "user_id": "7", "name": "Bot"},
+        {"type": "text", "text": "正文"},
+        {"type": "image", "url": "https://example.com/image.jpg"},
+    ]
+
+
+def test_extract_group_event_bounds_text_without_losing_original_components():
+    event = FakeEvent()
+    event.get_message_outline = lambda: "abcdef"
+
+    record = extract_group_event(event, max_text_chars=4)
+
+    assert record["text"] == "abcd"
+    assert len(record["components"]) == 4
+
+
+def test_extract_group_event_preserves_poke_actor_target_and_direction():
+    event = FakeEvent()
+    event._messages = [Comp.Poke(id="7")]
+    event.get_message_outline = lambda: "[ComponentType.Poke]"
+    event.get_message_str = lambda: ""
+
+    record = extract_group_event(event, max_text_chars=4000)
+
+    assert record["sender_id"] == "10001"
+    assert record["components"] == [
+        {"type": "poke", "target_id": "7"}
+    ]
+    assert record["text"] == "[戳一戳 target=7]"
+    assert record["is_directed_at_bot"] is True

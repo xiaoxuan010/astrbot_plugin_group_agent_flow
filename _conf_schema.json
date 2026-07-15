@@ -1,63 +1,104 @@
 {
-  "flow_settings": {
+  "agent_settings": {
     "type": "object",
-    "description": "Flow 设置",
-    "hint": "控制群聊消息流水的记录与注入",
+    "description": "Agent settings",
     "items": {
       "enabled": {
         "type": "bool",
-        "description": "启用插件",
+        "description": "Enable autonomous group observation",
         "default": true
+      },
+      "authorized_group_ids": {
+        "type": "list",
+        "description": "QQ groups allowed to run the agent",
+        "hint": "Empty disables autonomous runs. Add QQ group IDs as strings; * enables every group.",
+        "items": {"type": "string"},
+        "default": []
+      }
+    }
+  },
+  "scheduling": {
+    "type": "object",
+    "description": "Snapshot scheduling",
+    "items": {
+      "debounce_seconds": {
+        "type": "float",
+        "description": "Quiet delay for normal messages",
+        "default": 10.0
+      },
+      "direct_delay_seconds": {
+        "type": "float",
+        "description": "Quiet delay when the bot is mentioned",
+        "default": 1.0
+      },
+      "min_cycle_interval_seconds": {
+        "type": "float",
+        "description": "Minimum interval between reasoning cycles",
+        "default": 10.0
+      }
+    }
+  },
+  "context": {
+    "type": "object",
+    "description": "Persisted context and rendering",
+    "items": {
+      "renderer": {
+        "type": "string",
+        "description": "Context renderer for newly assigned conversations",
+        "hint": "Aggregated Delta Block (Dash-separated) uses one user message wrapped in <group_messages_delta> with --- separators; Aggregated Delta Block (Line-separated) joins structured event lines with newlines; Dedicated User Block per Message creates a separate role=user block for each event.",
+        "options": ["legacy_delta", "plain_lines", "native_messages"],
+        "labels": ["Aggregated Delta Block (Dash-separated)", "Aggregated Delta Block (Line-separated)", "Dedicated User Block per Message"],
+        "default": "legacy_delta"
+      },
+      "max_messages_per_cycle": {
+        "type": "int",
+        "description": "Maximum new messages in one snapshot",
+        "hint": "0 keeps the complete unconsumed delta. Older messages remain searchable through tools.",
+        "default": 200
       },
       "max_log_records": {
         "type": "int",
-        "description": "每个群保留的最大原始消息数",
-        "hint": "0 表示不限制。原始日志只用于增量注入，AstrBot 会话历史仍由 AstrBot 自己保存/压缩。",
-        "default": 5000,
-        "slider": {
-          "min": 0,
-          "max": 50000,
-          "step": 100
-        }
+        "description": "Maximum persisted records per group",
+        "hint": "0 disables retention trimming.",
+        "default": 10000
       },
-      "max_delta_messages": {
+      "max_text_chars": {
         "type": "int",
-        "description": "单次最多注入的增量消息数",
-        "hint": "0 表示不限制；若首次启用时群聊日志很长，可设置上限避免一次注入过多。",
-        "default": 0,
-        "slider": {
-          "min": 0,
-          "max": 1000,
-          "step": 10
-        }
+        "description": "Maximum stored outline length per message",
+        "default": 4000
       },
       "record_self_messages": {
         "type": "bool",
-        "description": "记录机器人自己的平台消息",
-        "hint": "仅针对非 LLM 流程产生的机器人自身平台消息；LLM 回复始终会被跳过，因为 AstrBot 已作为 assistant 历史保存。",
+        "description": "Record messages sent by the bot account",
+        "hint": "Enabled bot echo events can enter later snapshots and start another reasoning cycle.",
         "default": false
       },
       "record_empty_messages": {
         "type": "bool",
-        "description": "记录空文本消息",
-        "hint": "开启后图片、语音等无文本消息会以概要占位进入 flow。",
-        "default": true
-      },
-      "warn_builtin_ltm": {
-        "type": "bool",
-        "description": "检测到内置聊天记忆增强时输出警告",
-        "hint": "建议关闭 AstrBot 内置群聊上下文感知/聊天记忆增强，避免重复注入。",
+        "description": "Record messages with no text or components",
+        "hint": "Contentless transport events are retained for diagnostics and skipped before model inference.",
         "default": true
       }
     }
   },
-  "debug_settings": {
+  "prompt": {
     "type": "object",
-    "description": "调试设置",
+    "description": "Agent prompt",
+    "items": {
+      "custom_system_prompt": {
+        "type": "text",
+        "description": "Additional persona or group behavior instructions",
+        "default": ""
+      }
+    }
+  },
+  "debug": {
+    "type": "object",
+    "description": "Diagnostics",
     "items": {
       "debug_log": {
         "type": "bool",
-        "description": "输出调试日志",
+        "description": "Log snapshot preparation details",
         "default": false
       }
     }

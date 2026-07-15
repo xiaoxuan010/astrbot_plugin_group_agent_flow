@@ -1,0 +1,69 @@
+{
+  "metadata": {
+    "display_name": "群聊自主智能体 Flow",
+    "desc": "基于固定快照驱动的 QQ 群聊自主智能体，所有对外动作均通过工具调用，并支持可切换的上下文渲染格式。"
+  },
+  "config": {
+    "agent_settings": {
+      "description": "智能体设置",
+      "enabled": {
+        "description": "启用群聊自主观察"
+      },
+      "authorized_group_ids": {
+        "description": "授权群号",
+        "hint": "留空将关闭自主运行。请以字符串形式添加 QQ 群号；* 表示所有群。"
+      }
+    },
+    "scheduling": {
+      "description": "快照调度",
+      "debounce_seconds": {
+        "description": "普通消息防抖时间（秒）"
+      },
+      "direct_delay_seconds": {
+        "description": "定向消息等待时间（秒）"
+      },
+      "min_cycle_interval_seconds": {
+        "description": "最短推理周期间隔（秒）"
+      }
+    },
+    "context": {
+      "description": "上下文与持久化",
+      "renderer": {
+        "description": "新会话上下文渲染格式",
+        "hint": "聚合增量块（短线分隔）：单个 User 块，使用 <group_messages_delta> 包装并以 --- 分隔事件；聚合增量块（换行分隔）：单个 User 块，以换行分隔结构化事件；逐消息独占 User 块：每个群事件分别生成一条 role=user 消息。",
+        "labels": ["聚合增量块（短线分隔）", "聚合增量块（换行分隔）", "逐消息独占 User 块"]
+      },
+      "max_messages_per_cycle": {
+        "description": "每轮最大新增消息数",
+        "hint": "0 表示保留全部未消费增量。更早消息仍可通过历史工具检索。"
+      },
+      "max_log_records": {
+        "description": "每群最大持久化记录数",
+        "hint": "0 表示不裁剪历史记录。"
+      },
+      "max_text_chars": {
+        "description": "单条消息最大存储文本长度"
+      },
+      "record_self_messages": {
+        "description": "记录机器人账号发送的消息",
+        "hint": "启用后，机器人消息的回传事件可以进入后续快照并启动新的推理周期。"
+      },
+      "record_empty_messages": {
+        "description": "记录无文本或组件的消息",
+        "hint": "无内容的传输事件仅用于诊断，进入模型前会被跳过。"
+      }
+    },
+    "prompt": {
+      "description": "智能体提示词",
+      "custom_system_prompt": {
+        "description": "附加人格或群聊行为指令"
+      }
+    },
+    "debug": {
+      "description": "调试",
+      "debug_log": {
+        "description": "记录快照准备详情"
+      }
+    }
+  }
+}

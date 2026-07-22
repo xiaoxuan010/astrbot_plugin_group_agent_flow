@@ -62,6 +62,14 @@ class GroupRunCoordinator:
             # 直接提及机器人时，可以缩短普通消息批次的等待时间。
             state.due_at = min(state.due_at, candidate_due_at)
 
+    def include_pending_seq(self, flow_id: str, seq: int) -> bool:
+        """只扩展已有待处理快照，不为内部事实创建新调度。"""
+        state = self._flows.get(flow_id)
+        if state is None or state.pending_seq <= 0:
+            return False
+        state.pending_seq = max(state.pending_seq, int(seq))
+        return True
+
     def begin_if_due(self, flow_id: str, *, now: float) -> RunSnapshot | None:
         """群流水到期后，原子地占用当前待处理消息。"""
         state = self._flows.get(flow_id)

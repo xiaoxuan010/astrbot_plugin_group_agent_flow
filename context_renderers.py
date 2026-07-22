@@ -23,8 +23,38 @@ def _datetime(timestamp: Any) -> datetime:
         return datetime.fromtimestamp(0, tz=SHANGHAI_TZ)
 
 
+def _is_agent_action(event: dict[str, Any]) -> bool:
+    """识别插件生成的机器人动作事实。"""
+    return _one_line(event.get("record_kind")) == "agent_action"
+
+
+def _agent_action_line(event: dict[str, Any]) -> str:
+    """渲染不可作为 QQ 消息目标的机器人动作事实。"""
+    fields = [
+        "QQ",
+        f"group={_one_line(event.get('group_id'))}",
+        "actor=bot",
+        f"action={_one_line(event.get('action_name'))}",
+        f"status={_one_line(event.get('action_status'))}",
+        f"action_id={_one_line(event.get('message_id'))}",
+        f"time={_datetime(event.get('timestamp')).isoformat()}",
+    ]
+    target_message_id = _one_line(
+        event.get("target_message_id") or event.get("reply_to")
+    )
+    if target_message_id:
+        fields.append(f"target_msg={target_message_id}")
+    target_user_id = _one_line(event.get("target_user_id"))
+    if target_user_id:
+        fields.append(f"target_user={target_user_id}")
+    text = _one_line(event.get("text")) or "[动作]"
+    return f"[{' '.join(fields)}] {text}"
+
+
 def _structured_line(event: dict[str, Any]) -> str:
     """将一条事件渲染为带稳定路由和归属信息的文本行。"""
+    if _is_agent_action(event):
+        return _agent_action_line(event)
     fields = [
         "QQ",
         f"group={_one_line(event.get('group_id'))}",
@@ -61,6 +91,9 @@ class LegacyDeltaRenderer:
             return []
         lines = []
         for event in events:
+            if _is_agent_action(event):
+                lines.append(_agent_action_line(event))
+                continue
             sender = _one_line(event.get("sender_name")) or _one_line(
                 event.get("sender_id")
             )

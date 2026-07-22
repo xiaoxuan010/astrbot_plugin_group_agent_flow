@@ -26,6 +26,25 @@ class FakeBot:
 
 
 @pytest.mark.asyncio
+async def test_send_message_returns_visible_action_payload():
+    event = FakeEvent()
+    gateway = QQActionGateway()
+
+    result = await gateway.send_message(
+        event,
+        content="大家好",
+        mentions=["10001"],
+    )
+
+    assert result == {
+        "success": True,
+        "action": "send_message",
+        "content": "大家好",
+        "mentions": ["10001"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_reply_message_builds_reply_mentions_and_text_chain():
     event = FakeEvent()
     gateway = QQActionGateway()
@@ -46,7 +65,13 @@ async def test_reply_message_builds_reply_mentions_and_text_chain():
     assert str(chain[0].id) == "12345"
     assert str(chain[1].qq) == "10001"
     assert chain[2].text == "收到"
-    assert result["success"] is True
+    assert result == {
+        "success": True,
+        "action": "reply_message",
+        "message_id": "12345",
+        "content": "收到",
+        "mentions": ["10001"],
+    }
 
 
 @pytest.mark.asyncio

@@ -32,14 +32,19 @@ def prepare_observation(
     renderer_name: str,
     max_messages: int,
 ) -> PreparedObservation:
-    """渲染尚未消费且不超过固定快照序号的记录。"""
+    """渲染新事实，并重放近期机器人动作以跨终止轮次保留上下文。"""
     cursor = store.get_cursor(flow_id, conversation_id)
-    records = store.get_range(flow_id, cursor + 1, int(snapshot_seq))
+    visible_records = store.get_range(flow_id, 1, int(snapshot_seq))
     # 纯传输空事件可以保留用于诊断，但不包含可供模型观察的信息。
+    visible_records = [
+        record
+        for record in visible_records
+        if str(record.get("text") or "").strip() or record.get("components")
+    ]
     records = [
         record
-        for record in records
-        if str(record.get("text") or "").strip() or record.get("components")
+        for record in visible_records
+        if int(record.get("seq") or 0) > cursor
     ]
     skipped_count = 0
     limit = max(0, int(max_messages or 0))
@@ -47,6 +52,17 @@ def prepare_observation(
         # 被截去的较早记录仍可通过历史搜索工具读取。
         skipped_count = len(records) - limit
         records = records[-limit:]
+    if records:
+        remembered_actions = [
+            record
+            for record in visible_records
+            if int(record.get("seq") or 0) <= cursor
+            and str(record.get("record_kind") or "group_message")
+            == "agent_action"
+        ]
+        if limit:
+            remembered_actions = remembered_actions[-limit:]
+        records = [*remembered_actions, *records]
     renderer = build_renderer(renderer_name)
     return PreparedObservation(
         contexts=tuple(renderer.render(records)),

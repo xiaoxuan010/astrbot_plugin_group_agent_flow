@@ -68,6 +68,48 @@ def test_system_prompt_requires_tools_without_duplicating_tool_names():
 
 
 @pytest.mark.asyncio
+async def test_record_schedules_message_while_holding_the_flow_lock(monkeypatch):
+    flow_id = "qq:group:1"
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.config = {}
+    plugin._locks = {}
+    plugin.store = SimpleNamespace(append_record=lambda _flow_id, _record: 7)
+    enqueue_calls = []
+
+    class Coordinator:
+        def enqueue(self, actual_flow_id, *, seq, received_at, directed):
+            enqueue_calls.append(
+                (
+                    actual_flow_id,
+                    seq,
+                    directed,
+                    plugin._lock_for(actual_flow_id).locked(),
+                )
+            )
+
+    plugin.coordinator = Coordinator()
+    monkeypatch.setattr(
+        main_module,
+        "extract_group_event",
+        lambda _event, **_kwargs: {
+            "flow_id": flow_id,
+            "text": "hello",
+            "components": [],
+            "is_directed_at_bot": False,
+        },
+    )
+    event = FakeEvent({})
+    event.get_sender_id = lambda: "user-1"
+    event.get_self_id = lambda: "bot-1"
+    event.is_at_or_wake_command = False
+
+    recorded = await plugin._record(event, schedule=True)
+
+    assert recorded == (flow_id, 7, False)
+    assert enqueue_calls == [(flow_id, 7, False, True)]
+
+
+@pytest.mark.asyncio
 async def test_observation_request_uses_a_short_tool_call_reminder():
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
     plugin.config = {}
@@ -78,7 +120,14 @@ async def test_observation_request_uses_a_short_tool_call_reminder():
     )
     plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
 
-    async def record(_event):
+    async def record(_event, *, schedule):
+        assert schedule is True
+        plugin.coordinator.enqueue(
+            "qq:group:1",
+            seq=1,
+            received_at=0,
+            directed=False,
+        )
         return "qq:group:1", 1, False
 
     async def get_conversation(_event):
@@ -137,6 +186,120 @@ async def test_stay_silent_persists_outcome_and_advances_cursor(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_persist_agent_action_extends_only_an_existing_pending_snapshot(
+    tmp_path,
+):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(flow_id, {"message_id": "m1", "text": "first"})
+    store.append_record(flow_id, {"message_id": "m2", "text": "during run"})
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=0,
+        direct_delay_seconds=0,
+        min_cycle_interval_seconds=0,
+    )
+    coordinator.enqueue(flow_id, seq=2, received_at=100.0, directed=False)
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.coordinator = coordinator
+    plugin._locks = {}
+
+    seq = await plugin._persist_agent_action(
+        flow_id,
+        {"message_id": "agent-action:run-1:1", "text": "replied"},
+    )
+
+    assert seq == 3
+    assert coordinator.begin_if_due(flow_id, now=100.0).snapshot_seq == 3
+
+
+@pytest.mark.asyncio
+async def test_persist_agent_action_does_not_schedule_without_pending_message(tmp_path):
+    flow_id = "qq:group:1"
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = GroupFlowStore(tmp_path)
+    plugin.coordinator = GroupRunCoordinator()
+    plugin._locks = {}
+
+    seq = await plugin._persist_agent_action(
+        flow_id,
+        {"message_id": "agent-action:run-1:1", "text": "replied"},
+    )
+
+    assert seq == 1
+    assert plugin.coordinator.next_due_at(flow_id) is None
+
+
+@pytest.mark.asyncio
+async def test_later_actions_update_the_same_run_outcome(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.config = {}
+    plugin._locks = {}
+    event = FakeEvent(
+        {
+            FLOW_ID_EXTRA: flow_id,
+            RUN_ID_EXTRA: "batch-run",
+            SNAPSHOT_SEQ_EXTRA: 5,
+        }
+    )
+    event.set_extra(
+        "_group_agent_external_actions",
+        [{"action_name": "reply_message", "status": "succeeded", "detail": ""}],
+    )
+
+    await plugin._persist_observation_state(event, had_direct_output=False)
+    event.set_extra(
+        "_group_agent_external_actions",
+        [
+            {"action_name": "reply_message", "status": "succeeded", "detail": ""},
+            {
+                "action_name": "react_message",
+                "status": "failed",
+                "detail": "qq unavailable",
+            },
+        ],
+    )
+    await plugin._persist_observation_state(event, had_direct_output=False)
+
+    outcome = store.get_run_outcome("batch-run")
+    assert outcome["outcome"] == "action_partial"
+    assert outcome["detail"] == "reply_message,react_message"
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_keeps_safe_fact_persistence_diagnostics(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.config = {}
+    plugin._locks = {}
+    event = FakeEvent(
+        {
+            FLOW_ID_EXTRA: flow_id,
+            RUN_ID_EXTRA: "persist-failure-run",
+            SNAPSHOT_SEQ_EXTRA: 5,
+            "_group_agent_external_actions": [
+                {
+                    "action_name": "reply_message",
+                    "status": "succeeded",
+                    "detail": "fact_persist_failed:OSError",
+                }
+            ],
+        }
+    )
+
+    await plugin._persist_observation_state(event, had_direct_output=False)
+
+    outcome = store.get_run_outcome("persist-failure-run")
+    assert outcome["outcome"] == "action_succeeded"
+    assert outcome["detail"] == "reply_message(fact_persist_failed:OSError)"
+
+
+@pytest.mark.asyncio
 async def test_inject_snapshot_stops_before_provider_when_cursor_covers_snapshot(
     tmp_path,
 ):
@@ -184,6 +347,56 @@ async def test_inject_snapshot_stops_before_provider_when_cursor_covers_snapshot
     assert request.contexts == []
     assert request.func_tool is None
     assert store.get_run_outcome("stale-run")["outcome"] == "empty_snapshot_skipped"
+
+
+@pytest.mark.asyncio
+async def test_inject_snapshot_adds_completed_agent_action_to_provider_context(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        flow_id,
+        {
+            "record_kind": "agent_action",
+            "message_id": "agent-action:run-1:1",
+            "targetable": False,
+            "group_id": "1",
+            "sender_id": "7",
+            "self_id": "7",
+            "timestamp": 1710000000,
+            "text": "已经处理",
+            "components": [{"type": "text", "text": "已经处理"}],
+            "action_name": "reply_message",
+            "action_status": "succeeded",
+            "target_message_id": "m1",
+        },
+    )
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.config = {"context": {"renderer": "plain_lines"}}
+    plugin._locks = {}
+    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    event = FakeEvent(
+        {
+            AUTONOMOUS_EXTRA: True,
+            FLOW_ID_EXTRA: flow_id,
+            RUN_ID_EXTRA: "next-run",
+            SNAPSHOT_SEQ_EXTRA: 1,
+        }
+    )
+    request = SimpleNamespace(
+        conversation=SimpleNamespace(cid="conv"),
+        contexts=[],
+        func_tool=None,
+    )
+
+    await plugin.inject_snapshot(event, request)
+
+    assert len(request.contexts) == 1
+    assert "actor=bot action=reply_message status=succeeded" in request.contexts[0][
+        "content"
+    ]
+    assert "target_msg=m1" in request.contexts[0]["content"]
+    assert request.func_tool == "tools"
 
 
 @pytest.mark.asyncio

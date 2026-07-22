@@ -64,7 +64,7 @@ def test_search_records_applies_snapshot_sequence_before_limit(tmp_path):
     assert [item["message_id"] for item in results] == ["m2", "m3"]
 
 
-def test_run_outcome_is_persistent_and_first_write_wins(tmp_path):
+def test_run_outcome_updates_only_for_the_same_run_identity(tmp_path):
     store = GroupFlowStore(tmp_path)
 
     assert store.record_run_outcome(
@@ -78,10 +78,48 @@ def test_run_outcome_is_persistent_and_first_write_wins(tmp_path):
         flow_id="napcat:group:1",
         snapshot_seq=20,
         outcome="direct_output_suppressed",
+        detail="second action",
+    ) is True
+    assert store.record_run_outcome(
+        "run-1",
+        flow_id="napcat:group:2",
+        snapshot_seq=20,
+        outcome="action_failed",
+    ) is False
+    assert store.record_run_outcome(
+        "run-1",
+        flow_id="napcat:group:1",
+        snapshot_seq=21,
+        outcome="action_failed",
     ) is False
 
     reloaded = GroupFlowStore(tmp_path)
-    assert reloaded.get_run_outcome("run-1")["outcome"] == "no_action"
+    outcome = reloaded.get_run_outcome("run-1")
+    assert outcome["outcome"] == "direct_output_suppressed"
+    assert outcome["detail"] == "second action"
+
+
+def test_old_messages_and_agent_actions_survive_store_round_trip(tmp_path):
+    flow_id = "napcat:group:1"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(flow_id, {"message_id": "m1", "text": "legacy shape"})
+    store.append_record(
+        flow_id,
+        {
+            "record_kind": "agent_action",
+            "message_id": "agent-action:run-1:1",
+            "targetable": False,
+            "text": "replied",
+            "action_name": "reply_message",
+        },
+    )
+
+    records = GroupFlowStore(tmp_path).read_records(flow_id)
+
+    assert [record["seq"] for record in records] == [1, 2]
+    assert records[0].get("record_kind", "group_message") == "group_message"
+    assert records[1]["record_kind"] == "agent_action"
+    assert records[1]["targetable"] is False
 
 
 def test_import_legacy_data_copies_logs_and_state_once(tmp_path):

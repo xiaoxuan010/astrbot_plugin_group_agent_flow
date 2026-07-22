@@ -40,3 +40,79 @@ every persistence contract change.
 
 Avoid ad hoc file writes, path names derived directly from QQ IDs, and cursor advancement
 beyond the run's `snapshot_seq`.
+
+## Scenario: A terminal action enters the group fact stream
+
+### 1. Scope / Trigger
+
+An autonomous QQ action succeeds and returns AstrBot's terminal `None`. The action must remain
+visible to later observation cycles even when AstrBot conversation history skips that terminal
+tool call/result.
+
+### 2. Signatures
+
+- `build_agent_action_record(event, *, run_id, action_index, action_name, action_result) -> dict`
+- `GroupAgentFlowPlugin._persist_agent_action(flow_id, record) -> int`
+- `GroupRunCoordinator.include_pending_seq(flow_id, seq) -> bool`
+- `GroupFlowStore.record_run_outcome(run_id, *, flow_id, snapshot_seq, outcome, detail="") -> bool`
+
+### 3. Contracts
+
+- New inbound records carry `record_kind="group_message"`; old records without the field use
+  the same semantic default.
+- Successful visible actions carry `record_kind="agent_action"`, synthetic
+  `message_id="agent-action:{run_id}:{action_index}"`, `targetable=false`, bot sender identity,
+  structured components, action target, `action_status="succeeded"`, and the originating run.
+- `schema_version=2` identifies the shared envelope; `record_kind` identifies record semantics.
+- The plugin appends the action under the per-flow lock before the terminal callback commits
+  the original `snapshot_seq` cursor.
+- `include_pending_seq()` raises an existing pending upper bound and never creates a due time.
+  A later inbound event naturally covers an action written while no pending snapshot exists.
+- Persist and enqueue an inbound group message while holding the same per-flow lock. This closes
+  the interval where an action could be appended after the message but before its pending state.
+- When a snapshot has a new delta, replay recent consumed `agent_action` records from JSONL before
+  the delta. Reuse `max_messages_per_cycle` as the action-memory limit. An empty delta stays empty.
+- A repeated outcome write may update only the same `(run_id, flow_id, snapshot_seq)`. It keeps
+  the initial `recorded_at` and recomputes outcome/detail from the complete action batch.
+
+### 4. Validation & Error Matrix
+
+- Gateway failure -> failed run action; no `agent_action` record.
+- Gateway success plus action encoding failure -> successful run action with
+  `fact_encode_failed:<ExceptionType>`; terminal `None`; no QQ retry.
+- Gateway success plus JSONL write failure -> successful run action with
+  `fact_persist_failed:<ExceptionType>`; terminal `None`; no QQ retry.
+- Synthetic action ID passed to reply/react -> `message_not_found_in_snapshot`; zero gateway calls.
+- Action bot sender passed to poke validation -> excluded from the eligible user set.
+- Existing run ID with a different flow or snapshot -> outcome update rejected.
+
+### 5. Good/Base/Bad Cases
+
+- Good: message seq 11 arrives during reasoning, reply action becomes seq 12, and pending seq
+  advances from 11 to 12 before the next snapshot starts.
+- Base: action seq 11 is written with no pending message; a later message seq 12 schedules a
+  snapshot that includes both records.
+- Bad: the action remains outside JSONL or outside the next pending upper bound, so the model
+  sees the old user message without the completed reply fact.
+
+### 6. Tests Required
+
+- Codec tests cover all four action payloads, targets, components, synthetic ID, and bot identity.
+- Store tests reload mixed legacy/group/action records and verify same-run outcome updates plus
+  cross-route rejection.
+- Coordinator tests cover message-before-action and action-before-message orderings.
+- Tool tests assert successful persistence, encode/write failures, terminal `None`, one Provider
+  call, readable history, and synthetic target rejection.
+- Renderer tests cover all four actions in all three renderer formats without exposing
+  `msg=agent-action:...`.
+- Request-hook tests assert the next Provider context contains the completed action.
+- Observation tests advance the cursor through two terminal cycles and assert both later contexts
+  still contain the same completed action ID and target.
+
+### 7. Wrong vs Correct
+
+Wrong: save only `action_succeeded` in `state.json` and rely on AstrBot conversation history or
+adapter self-echoes to reconstruct the visible reply.
+
+Correct: append a typed action fact to the same ordered JSONL source, extend only an existing
+pending snapshot, then commit the terminal run state.

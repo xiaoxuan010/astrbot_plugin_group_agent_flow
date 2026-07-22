@@ -47,8 +47,18 @@ class QQActionGateway:
         mentions: list[str] | None = None,
     ) -> dict[str, Any]:
         """通过工具授权的发送入口发送普通群消息。"""
-        await tool_send(event, self._message_chain(content, mentions))
-        return {"success": True, "action": "send_message"}
+        normalized_content = str(content)
+        normalized_mentions = [str(user_id) for user_id in mentions or []]
+        await tool_send(
+            event,
+            self._message_chain(normalized_content, normalized_mentions),
+        )
+        return {
+            "success": True,
+            "action": "send_message",
+            "content": normalized_content,
+            "mentions": normalized_mentions,
+        }
 
     async def reply_message(
         self,
@@ -59,13 +69,18 @@ class QQActionGateway:
         mentions: list[str] | None = None,
     ) -> dict[str, Any]:
         """在消息链前添加目标 QQ 消息的引用组件。"""
-        chain = self._message_chain(content, mentions)
-        chain.chain.insert(0, Reply(id=str(message_id)))
+        normalized_message_id = str(message_id)
+        normalized_content = str(content)
+        normalized_mentions = [str(user_id) for user_id in mentions or []]
+        chain = self._message_chain(normalized_content, normalized_mentions)
+        chain.chain.insert(0, Reply(id=normalized_message_id))
         await tool_send(event, chain)
         return {
             "success": True,
             "action": "reply_message",
-            "message_id": str(message_id),
+            "message_id": normalized_message_id,
+            "content": normalized_content,
+            "mentions": normalized_mentions,
         }
 
     async def react_message(

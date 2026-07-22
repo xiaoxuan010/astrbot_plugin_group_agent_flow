@@ -17,6 +17,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .agent_tools import (
     FLOW_ID_EXTRA,
+    PLUGIN_NAME,
     RUN_ID_EXTRA,
     SILENCE_SELECTED_EXTRA,
     SNAPSHOT_SEQ_EXTRA,
@@ -38,7 +39,6 @@ from .response_policy import (
 from .store import GroupFlowStore
 
 
-PLUGIN_NAME = "astrbot_plugin_group_agent_flow"
 LEGACY_PLUGIN_NAME = "astrbot_plugin_group_context_flow"
 AUTONOMOUS_EXTRA = "_group_agent_autonomous"
 PENDING_CURSOR_EXTRA = "_group_agent_pending_cursor"
@@ -100,6 +100,20 @@ CONFIG_DEFAULTS = {
 }
 
 
+def _external_action_outcome_detail(actions: list[dict[str, Any]]) -> str:
+    """保存动作名，并只附带插件生成的安全持久化诊断。"""
+    parts: list[str] = []
+    safe_prefixes = ("fact_encode_failed:", "fact_persist_failed:")
+    for action in actions:
+        action_name = str(action.get("action_name") or "")
+        detail = str(action.get("detail") or "")
+        if detail.startswith(safe_prefixes):
+            parts.append(f"{action_name}({detail})")
+        else:
+            parts.append(action_name)
+    return ",".join(parts)
+
+
 class GroupAgentFlowPlugin(Star):
     """协调群消息持久化、快照推理和工具化外部动作。"""
 
@@ -115,6 +129,7 @@ class GroupAgentFlowPlugin(Star):
             self.store,
             QQActionGateway(),
             terminal_callback=self._finalize_terminal_observation,
+            action_persist_callback=self._persist_agent_action,
         )
 
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -156,6 +171,17 @@ class GroupAgentFlowPlugin(Star):
         """返回群级锁，串行化同一群流水的文件修改。"""
         return self._locks.setdefault(flow_id, asyncio.Lock())
 
+    async def _persist_agent_action(
+        self,
+        flow_id: str,
+        record: dict[str, Any],
+    ) -> int:
+        """写入动作事实，并将其纳入已经存在的下一快照。"""
+        async with self._lock_for(flow_id):
+            seq = self.store.append_record(flow_id, record)
+            self.coordinator.include_pending_seq(flow_id, seq)
+            return seq
+
     def _is_authorized(self, event: AstrMessageEvent) -> bool:
         """检查群白名单，其中 `*` 表示允许所有群。"""
         configured = self._cfg("authorized_group_ids", [])
@@ -171,8 +197,13 @@ class GroupAgentFlowPlugin(Star):
         command = str(event.get_message_str() or "").strip().split(" ", 1)[0]
         return command.lstrip("/") in {"gaf_status", "gaf_clear"}
 
-    async def _record(self, event: AstrMessageEvent) -> tuple[str, int, bool] | None:
-        """规范化并持久化事件，返回调度所需元数据。"""
+    async def _record(
+        self,
+        event: AstrMessageEvent,
+        *,
+        schedule: bool,
+    ) -> tuple[str, int, bool] | None:
+        """规范化事件，并在同一群锁内完成持久化与可选调度。"""
         sender_id = str(event.get_sender_id() or "")
         if sender_id == str(event.get_self_id() or "") and not bool(
             self._cfg("record_self_messages", False)
@@ -189,10 +220,17 @@ class GroupAgentFlowPlugin(Star):
         ):
             return None
         flow_id = str(record["flow_id"])
+        directed = bool(record["is_directed_at_bot"] or event.is_at_or_wake_command)
         async with self._lock_for(flow_id):
             seq = self.store.append_record(flow_id, record)
+            if schedule:
+                self.coordinator.enqueue(
+                    flow_id,
+                    seq=seq,
+                    received_at=time.monotonic(),
+                    directed=directed,
+                )
         event.set_extra("_group_agent_record_seq", seq)
-        directed = bool(record["is_directed_at_bot"] or event.is_at_or_wake_command)
         return flow_id, seq, directed
 
     async def _get_conversation(self, event: AstrMessageEvent):
@@ -230,17 +268,12 @@ class GroupAgentFlowPlugin(Star):
 
         # AstrBot 中该标志会阻止默认 LLM 链路，但不会阻止插件主动发起请求。
         event.should_call_llm(True)
-        recorded = await self._record(event)
-        if recorded is None or self._is_plugin_command(event):
+        plugin_command = self._is_plugin_command(event)
+        recorded = await self._record(event, schedule=not plugin_command)
+        if recorded is None or plugin_command:
             return
         suppress_builtin_active_reply(event)
-        flow_id, seq, directed = recorded
-        self.coordinator.enqueue(
-            flow_id,
-            seq=seq,
-            received_at=time.monotonic(),
-            directed=directed,
-        )
+        flow_id, _, _ = recorded
 
         # 多个事件处理器可以同时等待，调度器只允许其中一个启动本轮推理。
         while True:
@@ -398,9 +431,7 @@ class GroupAgentFlowPlugin(Star):
                 flow_id=flow_id,
                 snapshot_seq=snapshot_seq,
                 outcome=outcome,
-                detail=",".join(
-                    str(action.get("action_name") or "") for action in external_actions
-                ),
+                detail=_external_action_outcome_detail(external_actions),
             )
         pending = event.get_extra(PENDING_CURSOR_EXTRA, {})
         if isinstance(pending, dict) and pending.get("conversation_id"):

@@ -58,3 +58,41 @@ def test_finish_rejects_unknown_run():
         assert "missing" in str(exc)
     else:
         raise AssertionError("unknown run must raise KeyError")
+
+
+def test_include_pending_seq_extends_existing_snapshot_without_scheduling():
+    coordinator = GroupRunCoordinator(debounce_seconds=0, direct_delay_seconds=0)
+
+    assert coordinator.include_pending_seq("group:1", 12) is False
+    assert coordinator.next_due_at("group:1") is None
+
+    coordinator.enqueue("group:1", seq=11, received_at=100.0, directed=False)
+
+    assert coordinator.include_pending_seq("group:1", 12) is True
+    assert coordinator.begin_if_due("group:1", now=100.0).snapshot_seq == 12
+
+
+def test_action_seq_extends_messages_reserved_during_active_run():
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=0,
+        direct_delay_seconds=0,
+        min_cycle_interval_seconds=0,
+    )
+    coordinator.enqueue("group:1", seq=10, received_at=100.0, directed=False)
+    first = coordinator.begin_if_due("group:1", now=100.0)
+    coordinator.enqueue("group:1", seq=11, received_at=101.0, directed=False)
+
+    assert coordinator.include_pending_seq("group:1", 12) is True
+
+    coordinator.finish(first.run_id, finished_at=102.0)
+    second = coordinator.begin_if_due("group:1", now=102.0)
+    assert second.snapshot_seq == 12
+
+
+def test_message_arriving_after_an_unscheduled_action_covers_its_seq():
+    coordinator = GroupRunCoordinator(debounce_seconds=0, direct_delay_seconds=0)
+
+    assert coordinator.include_pending_seq("group:1", 12) is False
+    coordinator.enqueue("group:1", seq=13, received_at=100.0, directed=False)
+
+    assert coordinator.begin_if_due("group:1", now=100.0).snapshot_seq == 13

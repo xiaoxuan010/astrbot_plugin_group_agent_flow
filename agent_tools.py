@@ -5,17 +5,21 @@ from __future__ import annotations
 import json
 from typing import Any, Awaitable, Callable
 
+from astrbot.api import logger
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 
 try:
+    from .event_codec import build_agent_action_record
     from .qq_gateway import QQActionGateway, SUPPORTED_REACTIONS
-    from .response_policy import record_external_action
+    from .response_policy import EXTERNAL_ACTIONS_EXTRA, record_external_action
     from .store import GroupFlowStore
 except ImportError:
+    from event_codec import build_agent_action_record
     from qq_gateway import QQActionGateway, SUPPORTED_REACTIONS
-    from response_policy import record_external_action
+    from response_policy import EXTERNAL_ACTIONS_EXTRA, record_external_action
     from store import GroupFlowStore
 
+PLUGIN_NAME = "astrbot_plugin_group_agent_flow"
 RUN_ID_EXTRA = "_group_agent_run_id"
 FLOW_ID_EXTRA = "_group_agent_flow_id"
 SNAPSHOT_SEQ_EXTRA = "_group_agent_snapshot_seq"
@@ -35,11 +39,26 @@ class ToolRuntime:
         store: GroupFlowStore,
         gateway: QQActionGateway,
         terminal_callback: Callable[[Any], Awaitable[None]] | None = None,
+        action_persist_callback: Callable[
+            [str, dict[str, Any]], Awaitable[int]
+        ]
+        | None = None,
     ) -> None:
         """将持久化动作状态与 QQ 副作用网关组合起来。"""
         self.store = store
         self.gateway = gateway
         self.terminal_callback = terminal_callback
+        self.action_persist_callback = (
+            action_persist_callback or self._append_action_record
+        )
+
+    async def _append_action_record(
+        self,
+        flow_id: str,
+        record: dict[str, Any],
+    ) -> int:
+        """为独立 ToolRuntime 构造提供默认的事实写入路径。"""
+        return self.store.append_record(flow_id, record)
 
     @staticmethod
     def _run_metadata(event: Any) -> tuple[str, str, int]:
@@ -60,6 +79,15 @@ class ToolRuntime:
             return None
         return record
 
+    def _target_message_in_snapshot(
+        self, flow_id: str, message_id: str, snapshot_seq: int
+    ) -> dict[str, Any] | None:
+        """只返回可映射到平台消息 ID 的快照记录。"""
+        record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+        if record is None or record.get("targetable") is False:
+            return None
+        return record
+
     def _user_in_snapshot(self, flow_id: str, user_id: str, snapshot_seq: int) -> bool:
         """确认 QQ 用户作为发送者、提及或戳一戳目标出现在冻结快照中。"""
         target = str(user_id or "")
@@ -67,6 +95,8 @@ class ToolRuntime:
             return False
         for record in self.store.read_records(flow_id):
             if int(record.get("seq") or 0) > snapshot_seq:
+                continue
+            if str(record.get("record_kind") or "group_message") == "agent_action":
                 continue
             if str(record.get("sender_id") or "") == target:
                 return True
@@ -96,9 +126,9 @@ class ToolRuntime:
         operation: Callable[[], Awaitable[dict[str, Any]]],
     ) -> None:
         """执行一次外部动作，并返回 AstrBot 的 Agent Loop 终止信号。"""
-        self._run_metadata(event)
+        run_id, flow_id, _ = self._run_metadata(event)
         try:
-            await operation()
+            action_result = await operation()
         except Exception as exc:
             record_external_action(
                 event,
@@ -107,7 +137,42 @@ class ToolRuntime:
                 detail=str(exc),
             )
         else:
-            record_external_action(event, action_name=action_name, success=True)
+            actions = event.get_extra(EXTERNAL_ACTIONS_EXTRA, [])
+            action_index = len(actions) + 1 if isinstance(actions, list) else 1
+            detail = ""
+            try:
+                record = build_agent_action_record(
+                    event,
+                    run_id=run_id,
+                    action_index=action_index,
+                    action_name=action_name,
+                    action_result=action_result,
+                )
+            except Exception as exc:
+                detail = f"fact_encode_failed:{type(exc).__name__}"
+                logger.error(
+                    f"[{PLUGIN_NAME}] failed to encode agent action fact "
+                    f"flow_id={flow_id} run_id={run_id} "
+                    f"action={action_name} error={type(exc).__name__}",
+                    exc_info=True,
+                )
+            else:
+                try:
+                    await self.action_persist_callback(flow_id, record)
+                except Exception as exc:
+                    detail = f"fact_persist_failed:{type(exc).__name__}"
+                    logger.error(
+                        f"[{PLUGIN_NAME}] failed to persist agent action fact "
+                        f"flow_id={flow_id} run_id={run_id} "
+                        f"action={action_name} error={type(exc).__name__}",
+                        exc_info=True,
+                    )
+            record_external_action(
+                event,
+                action_name=action_name,
+                success=True,
+                detail=detail,
+            )
         if self.terminal_callback is not None:
             await self.terminal_callback(event)
         return None
@@ -135,7 +200,10 @@ class ToolRuntime:
         ) -> str:
             """仅引用回复当前快照中可见的消息。"""
             _, flow_id, snapshot_seq = self._run_metadata(event)
-            if self._message_in_snapshot(flow_id, message_id, snapshot_seq) is None:
+            if (
+                self._target_message_in_snapshot(flow_id, message_id, snapshot_seq)
+                is None
+            ):
                 return _json(
                     {
                         "success": False,
@@ -157,7 +225,10 @@ class ToolRuntime:
         async def react_message(event: Any, message_id: str, reaction: str) -> str:
             """仅对当前快照中可见的消息添加表情回应。"""
             _, flow_id, snapshot_seq = self._run_metadata(event)
-            if self._message_in_snapshot(flow_id, message_id, snapshot_seq) is None:
+            if (
+                self._target_message_in_snapshot(flow_id, message_id, snapshot_seq)
+                is None
+            ):
                 return _json(
                     {
                         "success": False,

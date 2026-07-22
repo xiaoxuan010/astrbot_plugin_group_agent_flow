@@ -5,7 +5,7 @@
 - Keep snapshot isolation end to end. Context preparation, history search, message lookup,
   reply, and reaction targets must all enforce `seq <= snapshot_seq`.
 - Route every externally visible autonomous action through the plugin-controlled send
-  boundary. Only `send_message`, `reply_message`, and `react_message` may reach QQ. Keep
+  boundary. Only `send_message`, `reply_message`, `react_message`, and `poke_user` may reach QQ. Keep
   ordinary `LLM_RESULT` content, reasoning, Provider errors, and internal tool status behind
   the send guard.
 - Keep renderer behavior deterministic. Renderer selection is assigned once per
@@ -18,6 +18,11 @@
   `OnLLMRequestEvent` before the Provider receives a request, and cursor updates remain
   monotonic across delayed runs.
 - Preserve structured message metadata in storage even when a renderer projects it to text.
+- Persist each successful external action as a typed, non-targetable fact before committing the
+  terminal cursor. Extend an existing pending snapshot with the action seq without creating a
+  second scheduling path.
+- Replay recent consumed action facts from JSONL whenever a new delta exists, bounded by the
+  existing cycle message limit, so consecutive terminal cycles retain completed-action context.
 - Keep `.astrbot-plugin/i18n/zh-CN.json` and `en-US.json` aligned with
   `_conf_schema.json`: every section and field has a localized `description`, schema
   `hint` and `labels` entries have matching localized entries, and translated labels
@@ -47,10 +52,18 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
 ## Review Checklist
 
 - Messages arriving during reasoning are reserved for the next snapshot.
+- A message reserved during reasoning followed by a later action record advances the existing
+  pending upper bound to the action seq; an action with no pending message remains unscheduled.
+- Inbound `append_record()` and coordinator `enqueue()` execute under one per-flow lock, so every
+  action ordering is covered by the next valid pending snapshot.
+- Two consecutive observations after cursor advancement both include the prior action fact; an
+  empty delta remains empty and does not schedule work from action memory alone.
 - Multiple external actions from one Provider tool batch may execute in declared order; the
-  batch ends without a follow-up Provider request. No tool call ends as a persisted no-action
-  outcome.
+  batch ends without a follow-up Provider request. Each callback recomputes the same run outcome
+  from the full accumulated action list. No tool call ends as a persisted no-action outcome.
 - Unknown or future message IDs cannot be read or targeted.
+- Synthetic `agent-action:*` IDs remain readable through history tools and are rejected by
+  reply/react target validation.
 - Ordinary provider content, reasoning, Provider errors, and internal tool status cannot reach
   QQ; an explicit action tool reaches QQ exactly once.
 - External action handlers return AstrBot's `None` terminal signal after persisting the run

@@ -44,9 +44,16 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 Provider 调用前记录 `empty_snapshot_skipped` 并终止该轮；cursor 始终单调递增。无文本且无组件的
 适配器传输事件可以保留用于诊断，进入模型前会被过滤。
 
-完整工具调用会继续由 AstrBot 原生 Agent history 保存。纯普通 `content` 会标记为不保存；
-与工具调用同响应的 `content` 仅作为 Provider 协议上下文保留，始终不会发送到群内。群消息原始组件、`message_id`、
-`reply_to`、发送者和时间戳存放在插件 JSONL 中，较早内容可通过历史工具按需读取。NapCat 的群戳一戳通知会记录
+终止型动作返回 `None` 后，AstrBot Agent history 可能跳过该轮 tool call/result；插件 JSONL
+承担完整群聊事实来源。入站事件保存为 `record_kind=group_message`，成功执行的
+`send_message`、`reply_message`、`react_message`、`poke_user` 保存为
+`record_kind=agent_action`。下一轮 renderer 会明确投影 `actor=bot`、动作、目标和成功状态。
+每个包含新群事实的观察轮次还会重放近期动作，保证连续终止工具轮次仍能看到已经完成的动作；
+重放数量沿用 `max_messages_per_cycle`。动作内部 ID 使用 `action_id=` 展示，并禁止作为 QQ reply/react 目标。
+
+纯普通 `content` 会标记为不保存；与工具调用同响应的 `content` 仅作为本轮 Provider
+协议上下文保留，始终不会发送到群内。群消息原始组件、`message_id`、`reply_to`、发送者和
+时间戳存放在插件 JSONL 中，较早内容可通过历史工具按需读取。NapCat 的群戳一戳通知会记录
 发起者和目标 QQ；戳到机器人时，该事件会标记为直接面向机器人。`poke_user` 仅接受冻结快照中已经出现的 QQ 用户。
 
 ## 配置

@@ -179,20 +179,32 @@ class GroupFlowStore:
         outcome: str,
         detail: str = "",
     ) -> bool:
-        """持久化观察轮次首次上报的最终结果。"""
+        """持久化结果，并允许同一轮次随 tool batch 进展更新。"""
         state = self.read_state()
         outcomes = state.setdefault("run_outcomes", {})
         if not isinstance(outcomes, dict):
             outcomes = {}
             state["run_outcomes"] = outcomes
-        if run_id in outcomes:
-            return False
+        recorded_at = int(time.time())
+        existing = outcomes.get(run_id)
+        if existing is not None:
+            if not isinstance(existing, dict):
+                return False
+            try:
+                same_snapshot = int(existing.get("snapshot_seq") or 0) == int(
+                    snapshot_seq
+                )
+            except (TypeError, ValueError):
+                same_snapshot = False
+            if str(existing.get("flow_id") or "") != str(flow_id) or not same_snapshot:
+                return False
+            recorded_at = int(existing.get("recorded_at") or recorded_at)
         outcomes[run_id] = {
             "flow_id": flow_id,
             "snapshot_seq": int(snapshot_seq),
             "outcome": str(outcome),
             "detail": str(detail),
-            "recorded_at": int(time.time()),
+            "recorded_at": recorded_at,
         }
         self.write_state(state)
         return True

@@ -1,3 +1,5 @@
+import pytest
+
 from context_renderers import build_renderer
 
 
@@ -21,6 +23,48 @@ EVENTS = [
         "timestamp": 1783836223,
         "text": "回复上一条",
         "reply_to": "msg-101",
+    },
+]
+
+ACTION_EVENTS = [
+    {
+        "record_kind": "agent_action",
+        "group_id": "1",
+        "message_id": "agent-action:run-1:1",
+        "timestamp": 1783836222,
+        "text": "[At:10001] 大家好",
+        "action_name": "send_message",
+        "action_status": "succeeded",
+    },
+    {
+        "record_kind": "agent_action",
+        "group_id": "1",
+        "message_id": "agent-action:run-1:2",
+        "timestamp": 1783836223,
+        "text": "收到",
+        "action_name": "reply_message",
+        "action_status": "succeeded",
+        "target_message_id": "msg-101",
+    },
+    {
+        "record_kind": "agent_action",
+        "group_id": "1",
+        "message_id": "agent-action:run-1:3",
+        "timestamp": 1783836224,
+        "text": "[消息表情 target=msg-102 reaction=赞]",
+        "action_name": "react_message",
+        "action_status": "succeeded",
+        "target_message_id": "msg-102",
+    },
+    {
+        "record_kind": "agent_action",
+        "group_id": "1",
+        "message_id": "agent-action:run-1:4",
+        "timestamp": 1783836225,
+        "text": "[戳一戳 target=10002]",
+        "action_name": "poke_user",
+        "action_status": "succeeded",
+        "target_user_id": "10002",
     },
 ]
 
@@ -80,3 +124,26 @@ def test_unknown_renderer_is_rejected():
         assert "unknown context renderer" in str(exc)
     else:
         raise AssertionError("unknown renderer must raise ValueError")
+
+
+@pytest.mark.parametrize(
+    "renderer_name",
+    ["legacy_delta", "plain_lines", "native_messages"],
+)
+def test_all_renderers_expose_completed_agent_actions(renderer_name):
+    messages = build_renderer(renderer_name).render(ACTION_EVENTS)
+
+    content = "\n".join(message["content"] for message in messages)
+    assert "actor=bot action=send_message status=succeeded" in content
+    assert "[At:10001] 大家好" in content
+    assert (
+        "actor=bot action=reply_message status=succeeded "
+        "action_id=agent-action:run-1:2"
+    ) in content
+    assert "target_msg=msg-101" in content
+    assert "action=react_message" in content
+    assert "target_msg=msg-102" in content
+    assert "reaction=赞" in content
+    assert "action=poke_user" in content
+    assert "target_user=10002" in content
+    assert "msg=agent-action:" not in content

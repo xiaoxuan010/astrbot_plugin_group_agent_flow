@@ -52,6 +52,104 @@ def _component_record(component: Any) -> dict[str, Any]:
     return {"type": _value(component_type or component.__class__.__name__).lower()}
 
 
+def _mention_records(mentions: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    """规范化动作回执中的提及列表。"""
+    if not isinstance(mentions, list):
+        mentions = []
+    user_ids = [_value(user_id) for user_id in mentions if _value(user_id)]
+    return user_ids, [
+        {"type": "at", "user_id": user_id, "name": ""}
+        for user_id in user_ids
+    ]
+
+
+def build_agent_action_record(
+    event: Any,
+    *,
+    run_id: str,
+    action_index: int,
+    action_name: str,
+    action_result: dict[str, Any],
+) -> dict[str, Any]:
+    """将成功 QQ 动作回执规范化为群聊事实记录。"""
+    result_action = _value(action_result.get("action"))
+    if action_result.get("success") is not True or result_action != action_name:
+        raise ValueError(
+            f"action result mismatch: expected {action_name}, got {result_action}"
+        )
+
+    reply_to: str | None = None
+    target_message_id: str | None = None
+    target_user_id: str | None = None
+    components: list[dict[str, Any]]
+    if action_name in {"send_message", "reply_message"}:
+        content = _value(action_result.get("content"))
+        user_ids, mention_components = _mention_records(
+            action_result.get("mentions")
+        )
+        text_parts = [*(f"[At:{user_id}]" for user_id in user_ids), content]
+        text = " ".join(part for part in text_parts if part)
+        components = [*mention_components, {"type": "text", "text": content}]
+        if action_name == "reply_message":
+            reply_to = _value(action_result.get("message_id"))
+            target_message_id = reply_to
+            components.insert(
+                0,
+                {"type": "reply", "message_id": reply_to, "sender_id": ""},
+            )
+    elif action_name == "react_message":
+        message_id = _value(action_result.get("message_id"))
+        target_message_id = message_id
+        reaction = _value(action_result.get("reaction"))
+        text = f"[消息表情 target={message_id} reaction={reaction}]"
+        components = [
+            {
+                "type": "reaction",
+                "message_id": message_id,
+                "reaction": reaction,
+            }
+        ]
+    elif action_name == "poke_user":
+        user_id = _value(action_result.get("user_id"))
+        target_user_id = user_id
+        text = f"[戳一戳 target={user_id}]"
+        components = [{"type": "poke", "target_id": user_id}]
+    else:
+        raise ValueError(f"unsupported agent action: {action_name}")
+
+    message_obj = event.message_obj
+    group = getattr(message_obj, "group", None)
+    platform_id = _value(event.get_platform_id())
+    group_id = _value(event.get_group_id())
+    self_id = _value(event.get_self_id())
+    return {
+        "schema_version": 2,
+        "record_kind": "agent_action",
+        "seq": 0,
+        "message_id": f"agent-action:{run_id}:{int(action_index)}",
+        "targetable": False,
+        "platform_id": platform_id,
+        "platform_name": _value(event.get_platform_name()),
+        "flow_id": f"{platform_id}:group:{group_id}",
+        "group_id": group_id,
+        "group_name": _value(getattr(group, "group_name", "")) if group else "",
+        "sender_id": self_id,
+        "sender_name": self_id,
+        "self_id": self_id,
+        "timestamp": int(time.time()),
+        "text": text,
+        "components": components,
+        "reply_to": reply_to,
+        "target_message_id": target_message_id,
+        "target_user_id": target_user_id,
+        "is_directed_at_bot": False,
+        "action_name": action_name,
+        "action_status": "succeeded",
+        "run_id": _value(run_id),
+        "action_index": int(action_index),
+    }
+
+
 def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, Any]:
     """从群事件提取路由、发送者、文本和消息组件。"""
     components = list(event.get_messages())
@@ -92,6 +190,7 @@ def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, 
 
     return {
         "schema_version": 2,
+        "record_kind": "group_message",
         "seq": 0,
         "message_id": message_id,
         "platform_id": platform_id,

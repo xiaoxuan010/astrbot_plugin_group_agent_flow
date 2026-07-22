@@ -36,6 +36,7 @@ Different Providers use that field for role-play replies or control statements s
 - `record_external_action(event, *, action_name: str, success: bool, detail: str = "") -> None`
 - `suppress_direct_output(response, *, run_context=None) -> bool`
 - `ToolRuntime._external(event, action_name, operation) -> None`
+- `build_agent_action_record(event, *, run_id, action_index, action_name, action_result) -> dict`
 - `stay_silent(event) -> None`
 - `classify_run_outcome(external_actions, *, silence_selected, had_direct_output) -> str`
 
@@ -54,6 +55,11 @@ Different Providers use that field for role-play replies or control statements s
   protocols and places the protocol at the end of `req.system_prompt` before Provider execution.
 - Explicit action tools call `tool_send()` through `QQActionGateway` and record the actual
   action name with `succeeded` or `failed` status.
+- A successful gateway result is encoded and persisted as `agent_action` before the terminal
+  callback. Encoding and write failures preserve the successful QQ result and attach only a
+  safe `fact_encode_failed:<type>` or `fact_persist_failed:<type>` diagnostic.
+- Multiple actions in one Provider tool batch update the same run outcome from the complete
+  accumulated action list; success plus failure becomes `action_partial`.
 - A response containing content `A` and `send_message("B")` sends only `B`.
 - A pure final assistant response is cleared and its runtime message is marked `_no_save`.
 - Content attached to a tool call remains internal Provider history and never reaches QQ.
@@ -72,6 +78,10 @@ Different Providers use that field for role-play replies or control statements s
 - General/provider error result -> blocked without hiding a previous persisted assistant message.
 - Internal tool status chain -> blocked with no action record.
 - QQ sender exception -> failed explicit action record followed by terminal `None`.
+- Action fact encoding failure after a successful send -> `action_succeeded` plus safe encoding
+  detail followed by terminal `None`.
+- Action fact write failure after a successful send -> `action_succeeded` plus safe persistence
+  detail followed by terminal `None`.
 - Invalid snapshot target before a gateway attempt -> structured JSON error; the model may
   choose a valid target in a later step.
 - `stay_silent` outside an autonomous run ->
@@ -97,6 +107,10 @@ Different Providers use that field for role-play replies or control statements s
 - History test asserts a suppressed pure assistant message is marked `_no_save`.
 - Core-executor test asserts a valid external handler produces `[None]`, the AstrBot terminal
   signal, while read-only handlers still return structured JSON.
+- Runner integration asserts a terminal action produces one Provider call, one QQ gateway call,
+  one `agent_action`, and no follow-up Provider request.
+- Batch tests assert later actions update the same run to the final succeeded/failed/partial
+  classification and keep safe fact diagnostics.
 - Silence-tool tests assert an empty object schema, marker-before-callback ordering, `[None]`,
   zero QQ effects, zero external action records, `silence_selected`, and cursor advancement.
 - Full suite asserts existing tool, snapshot, persistence, renderer, and i18n behavior.

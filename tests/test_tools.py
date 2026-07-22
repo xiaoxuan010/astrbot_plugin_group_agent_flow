@@ -3,9 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import agent_tools as agent_tools_module
 from agent_tools import SILENCE_SELECTED_EXTRA, ToolRuntime
+from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest, TokenUsage
+from astrbot.core.provider.provider import Provider
 from qq_gateway import QQActionGateway
 from store import GroupFlowStore
 
@@ -22,7 +27,10 @@ class FakeBot:
 class FakeEvent:
     def __init__(self):
         self.bot = FakeBot()
-        self.message_obj = SimpleNamespace(raw_message={})
+        self.message_obj = SimpleNamespace(
+            raw_message={},
+            group=SimpleNamespace(group_name="测试群"),
+        )
         self.sent = []
         self.extras = {
             "_group_agent_run_id": "run-1",
@@ -40,8 +48,48 @@ class FakeEvent:
     def get_result(self):
         return self.result
 
+    def get_platform_id(self):
+        return "napcat"
+
+    def get_platform_name(self):
+        return "aiocqhttp"
+
+    def get_group_id(self):
+        return "1"
+
+    def get_self_id(self):
+        return "7"
+
     async def send(self, chain):
         self.sent.append(chain)
+
+
+class TerminalActionProvider(Provider):
+    def __init__(self):
+        super().__init__({}, {})
+        self.call_count = 0
+
+    def get_current_key(self):
+        return "test"
+
+    def set_key(self, _key):
+        return None
+
+    async def get_models(self):
+        return ["test"]
+
+    async def text_chat(self, **_kwargs):
+        self.call_count += 1
+        return LLMResponse(
+            role="assistant",
+            tools_call_name=["send_message"],
+            tools_call_args=[{"content": "只发一次"}],
+            tools_call_ids=["call-1"],
+            usage=TokenUsage(input_other=10, output=5),
+        )
+
+    async def text_chat_stream(self, **kwargs):
+        yield await self.text_chat(**kwargs)
 
 
 def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
@@ -127,6 +175,16 @@ async def test_multiple_external_actions_execute_in_one_run(tmp_path):
         action["action_name"]
         for action in event.get_extra("_group_agent_external_actions")
     ] == ["react_message", "reply_message"]
+    action_records = [
+        record
+        for record in store.read_records("napcat:group:1")
+        if record.get("record_kind") == "agent_action"
+    ]
+    assert [record["action_name"] for record in action_records] == [
+        "react_message",
+        "reply_message",
+    ]
+    assert [record["action_index"] for record in action_records] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -161,6 +219,45 @@ async def test_external_message_tool_returns_astrbot_terminal_signal(tmp_path):
     assert finalized == [event]
     assert event.get_extra("_group_agent_external_actions") == [
         {"action_name": "send_message", "status": "succeeded", "detail": ""}
+    ]
+    records = runtime.store.read_records("napcat:group:1")
+    assert len(records) == 1
+    assert records[0]["record_kind"] == "agent_action"
+    assert records[0]["action_name"] == "send_message"
+    assert records[0]["text"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_terminal_action_stops_runner_without_another_provider_call(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    runtime = ToolRuntime(store, QQActionGateway())
+    event = FakeEvent()
+    provider = TerminalActionProvider()
+    request = ProviderRequest(
+        prompt="respond",
+        func_tool=runtime.build_tool_set(),
+        contexts=[],
+    )
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=request,
+        run_context=ContextWrapper(
+            context=SimpleNamespace(event=event, context=SimpleNamespace())
+        ),
+        tool_executor=FunctionToolExecutor(),
+        agent_hooks=BaseAgentRunHooks(),
+        streaming=False,
+    )
+
+    async for _ in runner.step_until_done(3):
+        pass
+
+    assert runner.done() is True
+    assert provider.call_count == 1
+    assert len(event.sent) == 1
+    assert [record["action_name"] for record in store.read_records("napcat:group:1")] == [
+        "send_message"
     ]
 
 
@@ -207,7 +304,8 @@ async def test_stay_silent_marks_cycle_and_returns_terminal_signal(tmp_path):
 
 @pytest.mark.asyncio
 async def test_failed_external_action_is_terminal_and_records_failure(tmp_path):
-    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    store = GroupFlowStore(tmp_path)
+    runtime = ToolRuntime(store, QQActionGateway())
     event = FakeEvent()
 
     async def fail_send(_chain):
@@ -229,6 +327,86 @@ async def test_failed_external_action_is_terminal_and_records_failure(tmp_path):
             "action_name": "send_message",
             "status": "failed",
             "detail": "qq unavailable",
+        }
+    ]
+    assert store.read_records("napcat:group:1") == []
+
+
+@pytest.mark.asyncio
+async def test_action_encoding_failure_is_terminal_after_successful_send(
+    tmp_path,
+    monkeypatch,
+):
+    finalized = []
+
+    async def finalize(event):
+        finalized.append(event)
+
+    def fail_encode(*_args, **_kwargs):
+        raise ValueError("invalid receipt")
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "build_agent_action_record",
+        fail_encode,
+    )
+    store = GroupFlowStore(tmp_path)
+    runtime = ToolRuntime(
+        store,
+        QQActionGateway(),
+        terminal_callback=finalize,
+    )
+    event = FakeEvent()
+
+    result = await runtime.build_tool_set().get_tool("send_message").handler(
+        event,
+        content="A",
+    )
+
+    assert result is None
+    assert len(event.sent) == 1
+    assert finalized == [event]
+    assert store.read_records("napcat:group:1") == []
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": "send_message",
+            "status": "succeeded",
+            "detail": "fact_encode_failed:ValueError",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_action_persistence_failure_is_terminal_after_successful_send(tmp_path):
+    finalized = []
+
+    async def fail_persist(_flow_id, _record):
+        raise OSError("disk full")
+
+    async def finalize(event):
+        finalized.append(event)
+
+    runtime = ToolRuntime(
+        GroupFlowStore(tmp_path),
+        QQActionGateway(),
+        terminal_callback=finalize,
+        action_persist_callback=fail_persist,
+    )
+    event = FakeEvent()
+
+    result = await runtime.build_tool_set().get_tool("send_message").handler(
+        event,
+        content="A",
+    )
+
+    assert result is None
+    assert len(event.sent) == 1
+    assert finalized == [event]
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": "send_message",
+            "status": "succeeded",
+            "detail": "fact_persist_failed:OSError",
         }
     ]
 
@@ -267,6 +445,58 @@ async def test_history_tools_return_records_without_claiming_terminal_slot(tmp_p
     assert message["message_id"] == "m1"
     assert [item["message_id"] for item in search["messages"]] == ["m1"]
     assert event.get_extra("_group_agent_external_actions", []) == []
+
+
+@pytest.mark.asyncio
+async def test_action_facts_are_readable_but_cannot_be_qq_targets(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    action_id = "agent-action:run-1:1"
+    store.append_record(
+        "napcat:group:1",
+        {
+            "record_kind": "agent_action",
+            "message_id": action_id,
+            "targetable": False,
+            "sender_id": "7",
+            "text": "已经回复",
+            "components": [{"type": "text", "text": "已经回复"}],
+        },
+    )
+    event = FakeEvent()
+    event.extras["_group_agent_snapshot_seq"] = 1
+    tools = ToolRuntime(store, QQActionGateway()).build_tool_set()
+
+    observed = json.loads(
+        await tools.get_tool("get_message").handler(event, message_id=action_id)
+    )
+    search = json.loads(
+        await tools.get_tool("search_chat_history").handler(event, query="已经回复")
+    )
+    reply = json.loads(
+        await tools.get_tool("reply_message").handler(
+            event,
+            message_id=action_id,
+            content="again",
+        )
+    )
+    reaction = json.loads(
+        await tools.get_tool("react_message").handler(
+            event,
+            message_id=action_id,
+            reaction="赞",
+        )
+    )
+    poke = json.loads(
+        await tools.get_tool("poke_user").handler(event, user_id="7")
+    )
+
+    assert observed["message_id"] == action_id
+    assert [item["message_id"] for item in search["messages"]] == [action_id]
+    assert reply["error"] == "message_not_found_in_snapshot"
+    assert reaction["error"] == "message_not_found_in_snapshot"
+    assert poke["error"] == "user_not_found_in_snapshot"
+    assert event.sent == []
+    assert event.bot.actions == []
 
 
 @pytest.mark.asyncio

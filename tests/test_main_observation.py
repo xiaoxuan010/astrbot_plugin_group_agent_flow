@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT.parent))
 
 from astrbot_plugin_group_agent_flow.agent_tools import (  # noqa: E402
     FLOW_ID_EXTRA,
+    RUN_GENERATION_EXTRA,
     RUN_ID_EXTRA,
     SILENCE_SELECTED_EXTRA,
     SNAPSHOT_SEQ_EXTRA,
@@ -25,7 +26,6 @@ from astrbot_plugin_group_agent_flow.main import (  # noqa: E402
 )
 from astrbot_plugin_group_agent_flow.store import GroupFlowStore  # noqa: E402
 
-
 class FakeEvent:
     def __init__(self, extras):
         self.extras = extras
@@ -40,6 +40,23 @@ class FakeEvent:
 
     def stop_event(self):
         self.stopped = True
+
+
+def _activate_run(plugin, flow_id: str, snapshot_seq: int):
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=0,
+        direct_delay_seconds=0,
+        min_cycle_interval_seconds=0,
+    )
+    coordinator.enqueue(
+        flow_id,
+        seq=snapshot_seq,
+        received_at=0,
+        directed=False,
+    )
+    snapshot = coordinator.begin_if_due(flow_id, now=0)
+    plugin.coordinator = coordinator
+    return snapshot
 
 
 def test_system_prompt_requires_tools_without_duplicating_tool_names():
@@ -118,6 +135,7 @@ async def test_observation_request_uses_a_short_tool_call_reminder():
         direct_delay_seconds=0,
         min_cycle_interval_seconds=0,
     )
+    plugin._locks = {}
     plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
 
     async def record(_event, *, schedule):
@@ -166,23 +184,30 @@ async def test_stay_silent_persists_outcome_and_advances_cursor(tmp_path):
     plugin.store = store
     plugin.config = {}
     plugin._locks = {}
+    snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {
             FLOW_ID_EXTRA: flow_id,
-            RUN_ID_EXTRA: "silent-run",
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
             SILENCE_SELECTED_EXTRA: True,
             SNAPSHOT_SEQ_EXTRA: 1,
             PENDING_CURSOR_EXTRA: {
                 "conversation_id": "conv",
                 "target_seq": 1,
+                "renderer": "plain_lines",
+                "window_blocks": ((1, 1),),
             },
         }
     )
 
     await plugin._persist_observation_state(event, had_direct_output=False)
 
-    assert store.get_run_outcome("silent-run")["outcome"] == "silence_selected"
+    assert store.get_run_outcome(snapshot.run_id)["outcome"] == "silence_selected"
     assert store.get_cursor(flow_id, "conv") == 1
+    assert store.get_observation_window(flow_id, "conv")["blocks"] == [
+        {"start_seq": 1, "end_seq": 1}
+    ]
 
 
 @pytest.mark.asyncio
@@ -198,6 +223,8 @@ async def test_persist_agent_action_extends_only_an_existing_pending_snapshot(
         direct_delay_seconds=0,
         min_cycle_interval_seconds=0,
     )
+    coordinator.enqueue(flow_id, seq=1, received_at=99.0, directed=False)
+    snapshot = coordinator.begin_if_due(flow_id, now=99.0)
     coordinator.enqueue(flow_id, seq=2, received_at=100.0, directed=False)
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
     plugin.store = store
@@ -207,9 +234,12 @@ async def test_persist_agent_action_extends_only_an_existing_pending_snapshot(
     seq = await plugin._persist_agent_action(
         flow_id,
         {"message_id": "agent-action:run-1:1", "text": "replied"},
+        run_id=snapshot.run_id,
+        generation=snapshot.generation,
     )
 
     assert seq == 3
+    coordinator.finish_if_active(snapshot.run_id, finished_at=100.0)
     assert coordinator.begin_if_due(flow_id, now=100.0).snapshot_seq == 3
 
 
@@ -218,15 +248,23 @@ async def test_persist_agent_action_does_not_schedule_without_pending_message(tm
     flow_id = "qq:group:1"
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
     plugin.store = GroupFlowStore(tmp_path)
-    plugin.coordinator = GroupRunCoordinator()
+    plugin.coordinator = GroupRunCoordinator(
+        debounce_seconds=0,
+        direct_delay_seconds=0,
+    )
     plugin._locks = {}
+    plugin.store.append_record(flow_id, {"message_id": "m1", "text": "first"})
+    plugin.coordinator.enqueue(flow_id, seq=1, received_at=0, directed=False)
+    snapshot = plugin.coordinator.begin_if_due(flow_id, now=0)
 
     seq = await plugin._persist_agent_action(
         flow_id,
         {"message_id": "agent-action:run-1:1", "text": "replied"},
+        run_id=snapshot.run_id,
+        generation=snapshot.generation,
     )
 
-    assert seq == 1
+    assert seq == 2
     assert plugin.coordinator.next_due_at(flow_id) is None
 
 
@@ -238,10 +276,12 @@ async def test_later_actions_update_the_same_run_outcome(tmp_path):
     plugin.store = store
     plugin.config = {}
     plugin._locks = {}
+    snapshot = _activate_run(plugin, flow_id, 5)
     event = FakeEvent(
         {
             FLOW_ID_EXTRA: flow_id,
-            RUN_ID_EXTRA: "batch-run",
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
             SNAPSHOT_SEQ_EXTRA: 5,
         }
     )
@@ -264,7 +304,7 @@ async def test_later_actions_update_the_same_run_outcome(tmp_path):
     )
     await plugin._persist_observation_state(event, had_direct_output=False)
 
-    outcome = store.get_run_outcome("batch-run")
+    outcome = store.get_run_outcome(snapshot.run_id)
     assert outcome["outcome"] == "action_partial"
     assert outcome["detail"] == "reply_message,react_message"
 
@@ -277,10 +317,12 @@ async def test_run_outcome_keeps_safe_fact_persistence_diagnostics(tmp_path):
     plugin.store = store
     plugin.config = {}
     plugin._locks = {}
+    snapshot = _activate_run(plugin, flow_id, 5)
     event = FakeEvent(
         {
             FLOW_ID_EXTRA: flow_id,
-            RUN_ID_EXTRA: "persist-failure-run",
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
             SNAPSHOT_SEQ_EXTRA: 5,
             "_group_agent_external_actions": [
                 {
@@ -294,9 +336,60 @@ async def test_run_outcome_keeps_safe_fact_persistence_diagnostics(tmp_path):
 
     await plugin._persist_observation_state(event, had_direct_output=False)
 
-    outcome = store.get_run_outcome("persist-failure-run")
+    outcome = store.get_run_outcome(snapshot.run_id)
     assert outcome["outcome"] == "action_succeeded"
     assert outcome["detail"] == "reply_message(fact_persist_failed:OSError)"
+
+
+@pytest.mark.asyncio
+async def test_clear_invalidates_old_run_state_and_action_writes(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(flow_id, {"message_id": "m1", "text": "hello"})
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.config = {}
+    plugin._locks = {}
+    snapshot = _activate_run(plugin, flow_id, 1)
+    event = FakeEvent(
+        {
+            FLOW_ID_EXTRA: flow_id,
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
+            SILENCE_SELECTED_EXTRA: True,
+            SNAPSHOT_SEQ_EXTRA: 1,
+            PENDING_CURSOR_EXTRA: {
+                "conversation_id": "conv",
+                "target_seq": 1,
+                "renderer": "plain_lines",
+                "window_blocks": ((1, 1),),
+            },
+        }
+    )
+
+    clear_event = FakeEvent({})
+    clear_event.get_message_type = lambda: main_module.MessageType.GROUP_MESSAGE
+    clear_event.get_platform_id = lambda: "qq"
+    clear_event.get_group_id = lambda: "1"
+    clear_event.plain_result = lambda content: content
+
+    results = [
+        result async for result in plugin.group_agent_clear(clear_event)
+    ]
+
+    await plugin._persist_observation_state(event, had_direct_output=False)
+    with pytest.raises(RuntimeError, match="stale autonomous group run"):
+        await plugin._persist_agent_action(
+            flow_id,
+            {"message_id": "agent-action:old:1", "text": "old"},
+            run_id=snapshot.run_id,
+            generation=snapshot.generation,
+        )
+
+    assert store.read_records(flow_id) == []
+    assert store.get_cursor(flow_id, "conv") == 0
+    assert store.get_run_outcome(snapshot.run_id) is None
+    assert results == ["Group Agent Flow data cleared for this group."]
 
 
 @pytest.mark.asyncio
@@ -327,16 +420,18 @@ async def test_inject_snapshot_stops_before_provider_when_cursor_covers_snapshot
     plugin.config = {}
     plugin._locks = {}
     plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {
             AUTONOMOUS_EXTRA: True,
             FLOW_ID_EXTRA: flow_id,
-            RUN_ID_EXTRA: "stale-run",
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
             SNAPSHOT_SEQ_EXTRA: 1,
         }
     )
     request = SimpleNamespace(
-        conversation=SimpleNamespace(cid="conv"),
+        conversation=SimpleNamespace(cid="conv", token_usage=999),
         contexts=[],
         func_tool=None,
     )
@@ -346,7 +441,8 @@ async def test_inject_snapshot_stops_before_provider_when_cursor_covers_snapshot
     assert event.stopped is True
     assert request.contexts == []
     assert request.func_tool is None
-    assert store.get_run_outcome("stale-run")["outcome"] == "empty_snapshot_skipped"
+    assert request.conversation.token_usage == 0
+    assert store.get_run_outcome(snapshot.run_id)["outcome"] == "empty_snapshot_skipped"
 
 
 @pytest.mark.asyncio
@@ -375,17 +471,22 @@ async def test_inject_snapshot_adds_completed_agent_action_to_provider_context(t
     plugin.config = {"context": {"renderer": "plain_lines"}}
     plugin._locks = {}
     plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {
             AUTONOMOUS_EXTRA: True,
             FLOW_ID_EXTRA: flow_id,
-            RUN_ID_EXTRA: "next-run",
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
             SNAPSHOT_SEQ_EXTRA: 1,
         }
     )
     request = SimpleNamespace(
-        conversation=SimpleNamespace(cid="conv"),
-        contexts=[],
+        conversation=SimpleNamespace(cid="conv", token_usage=999),
+        contexts=[
+            {"role": "assistant", "content": "old assistant history"},
+            {"role": "tool", "content": "old tool result"},
+        ],
         func_tool=None,
     )
 
@@ -396,7 +497,18 @@ async def test_inject_snapshot_adds_completed_agent_action_to_provider_context(t
         "content"
     ]
     assert "target_msg=m1" in request.contexts[0]["content"]
+    assert all("old " not in context["content"] for context in request.contexts)
+    assert request.conversation.token_usage == 0
     assert request.func_tool == "tools"
+    assert store.get_cursor(flow_id, "conv") == 0
+    assert store.get_observation_window(flow_id, "conv") is None
+
+    await plugin._persist_observation_state(event, had_direct_output=False)
+
+    assert store.get_cursor(flow_id, "conv") == 1
+    assert store.get_observation_window(flow_id, "conv")["blocks"] == [
+        {"start_seq": 1, "end_seq": 1}
+    ]
 
 
 @pytest.mark.asyncio
@@ -419,16 +531,18 @@ async def test_final_prompt_hook_moves_protocol_after_later_astrbot_hooks(tmp_pa
     plugin.config = {}
     plugin._locks = {}
     plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {
             AUTONOMOUS_EXTRA: True,
             FLOW_ID_EXTRA: flow_id,
-            RUN_ID_EXTRA: "current-run",
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
             SNAPSHOT_SEQ_EXTRA: 1,
         }
     )
     request = SimpleNamespace(
-        conversation=SimpleNamespace(cid="conv"),
+        conversation=SimpleNamespace(cid="conv", token_usage=0),
         contexts=[],
         func_tool=None,
         system_prompt=main_module.AGENT_PROTOCOL_PROMPT,

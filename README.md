@@ -40,16 +40,23 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 记录边界；仓库中尚无模型评测能确定最优格式。renderer 会在某个 conversation 首次运行时固定，
 修改默认值只影响新 conversation，方便对三种格式进行独立对照。
 
-插件热重载可能留下正在等待的旧调度协程。旧协程的 `snapshot_seq` 已被新实例消费时，插件会在
-Provider 调用前记录 `empty_snapshot_skipped` 并终止该轮；cursor 始终单调递增。无文本且无组件的
-适配器传输事件可以保留用于诊断，进入模型前会被过滤。
+每轮请求会用插件持久化窗口替换 AstrBot conversation contexts，并将 conversation token usage
+重置后交给 Core 重新统计。`max_context_tokens` 默认 8192，使用 AstrBot Core
+`EstimateTokenCounter` 计数。每次观察形成一个独立块；超限时按
+`rotation_retention_ratio` 从最旧完整块批量轮转，默认保留到 50%，减少逐块移动造成的前缀缓存失效。
+最新块单独超限时会移除块内最旧记录；单条记录仍超限时保留元数据、内容尾部和 `get_message`
+查询提示。更早的完整记录始终保留在 JSONL 中，可通过历史工具读取。
+
+插件热重载或 `/gaf_clear` 会让旧调度 run 失效。旧 run 后续的 cursor、窗口和动作事实回写会被
+拒绝；清理先于动作准入时，QQ 网关也不会执行该动作。无文本且无组件的适配器传输事件可以保留
+用于诊断，进入模型前会被过滤。
 
 终止型动作返回 `None` 后，AstrBot Agent history 可能跳过该轮 tool call/result；插件 JSONL
 承担完整群聊事实来源。入站事件保存为 `record_kind=group_message`，成功执行的
 `send_message`、`reply_message`、`react_message`、`poke_user` 保存为
 `record_kind=agent_action`。下一轮 renderer 会明确投影 `actor=bot`、动作、目标和成功状态。
-每个包含新群事实的观察轮次还会重放近期动作，保证连续终止工具轮次仍能看到已经完成的动作；
-重放数量沿用 `max_messages_per_cycle`。动作内部 ID 使用 `action_id=` 展示，并禁止作为 QQ reply/react 目标。
+动作事实与群消息共同进入持久化观察块；活动窗口内的已完成动作会随对应块稳定重建。
+动作内部 ID 使用 `action_id=` 展示，并禁止作为 QQ reply/react 目标。
 
 纯普通 `content` 会标记为不保存；与工具调用同响应的 `content` 仅作为本轮 Provider
 协议上下文保留，始终不会发送到群内。群消息原始组件、`message_id`、`reply_to`、发送者和
@@ -80,7 +87,7 @@ AstrBot 群聊 LTM，避免维护一份闲置的重复记录。插件会接管�
 ## 指令
 
 - `/gaf_status`：查看授权状态、消息记录数、快照游标和 conversation。
-- `/gaf_clear`：管理员清空当前群的日志、游标和 renderer 分配。
+- `/gaf_clear`：管理员清空当前群的日志、游标、观察窗口、运行结果和内存调度状态。
 
 ## 本地测试
 

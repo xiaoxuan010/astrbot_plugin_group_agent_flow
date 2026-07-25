@@ -259,6 +259,25 @@ class GroupFlowStore:
     ) -> None:
         """提交会话 cursor，并保留可读的路由元数据。"""
         state = self.read_state()
+        self._apply_cursor_state(
+            state,
+            flow_id,
+            conversation_id,
+            seq,
+            unified_msg_origin=unified_msg_origin,
+        )
+        self.write_state(state)
+
+    def _apply_cursor_state(
+        self,
+        state: dict[str, Any],
+        flow_id: str,
+        conversation_id: str,
+        seq: int,
+        *,
+        unified_msg_origin: str,
+    ) -> None:
+        """在现有 state 对象中单调更新 cursor 与路由元数据。"""
         cursors = state.setdefault("cursors", {})
         cursor_meta = state.setdefault("cursor_meta", {})
         if not isinstance(cursors, dict):
@@ -279,7 +298,6 @@ class GroupFlowStore:
             "conversation_id": conversation_id,
             "unified_msg_origin": unified_msg_origin,
         }
-        self.write_state(state)
 
     def get_or_assign_renderer(
         self, flow_id: str, conversation_id: str, default_renderer: str
@@ -299,20 +317,123 @@ class GroupFlowStore:
         self.write_state(state)
         return assigned
 
+    @staticmethod
+    def _normalize_observation_window(value: Any) -> dict[str, Any] | None:
+        """校验活动窗口结构，并返回与持久化对象解耦的副本。"""
+        if not isinstance(value, dict):
+            return None
+        renderer = str(value.get("renderer") or "")
+        raw_blocks = value.get("blocks")
+        if not renderer or not isinstance(raw_blocks, list):
+            return None
+
+        blocks: list[dict[str, int]] = []
+        previous_end = 0
+        for raw_block in raw_blocks:
+            if not isinstance(raw_block, dict):
+                return None
+            try:
+                start_seq = int(raw_block.get("start_seq") or 0)
+                end_seq = int(raw_block.get("end_seq") or 0)
+            except (TypeError, ValueError):
+                return None
+            if start_seq <= 0 or end_seq < start_seq or start_seq <= previous_end:
+                return None
+            blocks.append({"start_seq": start_seq, "end_seq": end_seq})
+            previous_end = end_seq
+        return {"renderer": renderer, "blocks": blocks}
+
+    def get_observation_window(
+        self, flow_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """返回会话当前活动 observation 块窗口。"""
+        windows = self.read_state().get("observation_windows", {})
+        if not isinstance(windows, dict):
+            return None
+        return self._normalize_observation_window(
+            windows.get(self._cursor_key(flow_id, conversation_id))
+        )
+
+    def set_observation_window(
+        self,
+        flow_id: str,
+        conversation_id: str,
+        *,
+        renderer_name: str,
+        blocks: list[dict[str, int]],
+    ) -> None:
+        """持久化会话活动窗口的稳定块边界。"""
+        normalized = self._normalize_observation_window(
+            {"renderer": renderer_name, "blocks": blocks}
+        )
+        if normalized is None:
+            raise ValueError("invalid observation window")
+        state = self.read_state()
+        windows = state.setdefault("observation_windows", {})
+        if not isinstance(windows, dict):
+            windows = {}
+            state["observation_windows"] = windows
+        windows[self._cursor_key(flow_id, conversation_id)] = normalized
+        self.write_state(state)
+
+    def commit_observation(
+        self,
+        flow_id: str,
+        conversation_id: str,
+        seq: int,
+        *,
+        unified_msg_origin: str,
+        renderer_name: str,
+        blocks: list[dict[str, int]],
+    ) -> None:
+        """在一次 state 文件替换中提交 cursor 与活动窗口。"""
+        normalized = self._normalize_observation_window(
+            {"renderer": renderer_name, "blocks": blocks}
+        )
+        if normalized is None:
+            raise ValueError("invalid observation window")
+        state = self.read_state()
+        self._apply_cursor_state(
+            state,
+            flow_id,
+            conversation_id,
+            seq,
+            unified_msg_origin=unified_msg_origin,
+        )
+        windows = state.setdefault("observation_windows", {})
+        if not isinstance(windows, dict):
+            windows = {}
+            state["observation_windows"] = windows
+        windows[self._cursor_key(flow_id, conversation_id)] = normalized
+        self.write_state(state)
+
     def clear_flow(self, flow_id: str) -> None:
-        """清除指定流水的日志、cursor 和 renderer 分配。"""
+        """清除指定流水的日志与全部会话运行状态。"""
         path = self._log_path(flow_id)
         if path.exists():
             path.unlink()
 
         flow_hash = self._flow_hash(flow_id)
         state = self.read_state()
-        for section_name in ("cursors", "cursor_meta", "renderer_assignments"):
+        for section_name in (
+            "cursors",
+            "cursor_meta",
+            "renderer_assignments",
+            "observation_windows",
+        ):
             section = state.get(section_name, {})
             if isinstance(section, dict):
                 for key in list(section.keys()):
                     if str(key).startswith(f"{flow_hash}:"):
                         section.pop(key, None)
+        outcomes = state.get("run_outcomes", {})
+        if isinstance(outcomes, dict):
+            for run_id, outcome in list(outcomes.items()):
+                if (
+                    isinstance(outcome, dict)
+                    and str(outcome.get("flow_id") or "") == flow_id
+                ):
+                    outcomes.pop(run_id, None)
         self.write_state(state)
 
     def stats(self, flow_id: str, conversation_id: str | None = None) -> dict[str, int]:

@@ -23,6 +23,7 @@ PLUGIN_NAME = "astrbot_plugin_group_agent_flow"
 RUN_ID_EXTRA = "_group_agent_run_id"
 FLOW_ID_EXTRA = "_group_agent_flow_id"
 SNAPSHOT_SEQ_EXTRA = "_group_agent_snapshot_seq"
+RUN_GENERATION_EXTRA = "_group_agent_run_generation"
 SILENCE_SELECTED_EXTRA = "_group_agent_silence_selected"
 
 
@@ -40,7 +41,11 @@ class ToolRuntime:
         gateway: QQActionGateway,
         terminal_callback: Callable[[Any], Awaitable[None]] | None = None,
         action_persist_callback: Callable[
-            [str, dict[str, Any]], Awaitable[int]
+            ..., Awaitable[int]
+        ]
+        | None = None,
+        action_admission_callback: Callable[
+            [str, str, int], Awaitable[bool]
         ]
         | None = None,
     ) -> None:
@@ -51,24 +56,29 @@ class ToolRuntime:
         self.action_persist_callback = (
             action_persist_callback or self._append_action_record
         )
+        self.action_admission_callback = action_admission_callback
 
     async def _append_action_record(
         self,
         flow_id: str,
         record: dict[str, Any],
+        *,
+        run_id: str,
+        generation: int,
     ) -> int:
         """为独立 ToolRuntime 构造提供默认的事实写入路径。"""
         return self.store.append_record(flow_id, record)
 
     @staticmethod
-    def _run_metadata(event: Any) -> tuple[str, str, int]:
+    def _run_metadata(event: Any) -> tuple[str, str, int, int]:
         """读取并校验观察处理器附加的本轮元数据。"""
         run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
         flow_id = str(event.get_extra(FLOW_ID_EXTRA, "") or "")
         snapshot_seq = int(event.get_extra(SNAPSHOT_SEQ_EXTRA, 0) or 0)
+        generation = int(event.get_extra(RUN_GENERATION_EXTRA, -1))
         if not run_id or not flow_id or snapshot_seq <= 0:
             raise RuntimeError("tool called outside an autonomous group run")
-        return run_id, flow_id, snapshot_seq
+        return run_id, flow_id, snapshot_seq, generation
 
     def _message_in_snapshot(
         self, flow_id: str, message_id: str, snapshot_seq: int
@@ -126,7 +136,23 @@ class ToolRuntime:
         operation: Callable[[], Awaitable[dict[str, Any]]],
     ) -> None:
         """执行一次外部动作，并返回 AstrBot 的 Agent Loop 终止信号。"""
-        run_id, flow_id, _ = self._run_metadata(event)
+        run_id, flow_id, _, generation = self._run_metadata(event)
+        if self.action_admission_callback is not None:
+            admitted = await self.action_admission_callback(
+                flow_id,
+                run_id,
+                generation,
+            )
+            if not admitted:
+                record_external_action(
+                    event,
+                    action_name=action_name,
+                    success=False,
+                    detail="stale_run",
+                )
+                if self.terminal_callback is not None:
+                    await self.terminal_callback(event)
+                return None
         try:
             action_result = await operation()
         except Exception as exc:
@@ -158,7 +184,12 @@ class ToolRuntime:
                 )
             else:
                 try:
-                    await self.action_persist_callback(flow_id, record)
+                    await self.action_persist_callback(
+                        flow_id,
+                        record,
+                        run_id=run_id,
+                        generation=generation,
+                    )
                 except Exception as exc:
                     detail = f"fact_persist_failed:{type(exc).__name__}"
                     logger.error(
@@ -199,7 +230,7 @@ class ToolRuntime:
             mentions: list[str] | None = None,
         ) -> str:
             """仅引用回复当前快照中可见的消息。"""
-            _, flow_id, snapshot_seq = self._run_metadata(event)
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             if (
                 self._target_message_in_snapshot(flow_id, message_id, snapshot_seq)
                 is None
@@ -224,7 +255,7 @@ class ToolRuntime:
 
         async def react_message(event: Any, message_id: str, reaction: str) -> str:
             """仅对当前快照中可见的消息添加表情回应。"""
-            _, flow_id, snapshot_seq = self._run_metadata(event)
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             if (
                 self._target_message_in_snapshot(flow_id, message_id, snapshot_seq)
                 is None
@@ -246,7 +277,7 @@ class ToolRuntime:
 
         async def poke_user(event: Any, user_id: str) -> str:
             """仅戳当前冻结快照中已出现的 QQ 用户。"""
-            _, flow_id, snapshot_seq = self._run_metadata(event)
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             if not self._user_in_snapshot(flow_id, user_id, snapshot_seq):
                 return _json(
                     {
@@ -271,7 +302,7 @@ class ToolRuntime:
 
         async def get_message(event: Any, message_id: str) -> str:
             """读取一条持久化消息，同时遵守快照边界。"""
-            _, flow_id, snapshot_seq = self._run_metadata(event)
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
             return _json(
                 record
@@ -290,7 +321,7 @@ class ToolRuntime:
             limit: int = 20,
         ) -> str:
             """搜索本地群历史，结果上限为本轮快照序号。"""
-            _, flow_id, snapshot_seq = self._run_metadata(event)
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             messages = self.store.search_records(
                 flow_id,
                 query=query,

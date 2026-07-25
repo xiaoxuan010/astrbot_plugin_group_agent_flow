@@ -33,9 +33,13 @@
         "hint": "Aggregated Delta Block (Dash-separated) uses one user message wrapped in <group_messages_delta> with --- separators; Aggregated Delta Block (Line-separated) joins structured event lines with newlines; Dedicated User Block per Message creates a separate role=user block for each event.",
         "labels": ["Aggregated Delta Block (Dash-separated)", "Aggregated Delta Block (Line-separated)", "Dedicated User Block per Message"]
       },
-      "max_messages_per_cycle": {
-        "description": "Maximum new messages per cycle",
-        "hint": "0 keeps the complete unconsumed delta. Older messages remain searchable through history tools."
+      "max_context_tokens": {
+        "description": "Maximum observation context tokens",
+        "hint": "Uses AstrBot Core's token counter. The latest observation block drops its oldest records first when it alone exceeds the budget; older records remain searchable through history tools."
+      },
+      "rotation_retention_ratio": {
+        "description": "Context retained after block rotation",
+        "hint": "When the token budget overflows, oldest complete blocks are removed until usage reaches this fraction. Runtime values are constrained to 0.1-0.9."
       },
       "max_log_records": {
         "description": "Maximum persisted records per group",

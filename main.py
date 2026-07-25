@@ -18,6 +18,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .agent_tools import (
     FLOW_ID_EXTRA,
     PLUGIN_NAME,
+    RUN_GENERATION_EXTRA,
     RUN_ID_EXTRA,
     SILENCE_SELECTED_EXTRA,
     SNAPSHOT_SEQ_EXTRA,
@@ -74,7 +75,8 @@ CONFIG_PATHS = {
     "direct_delay_seconds": ("scheduling", "direct_delay_seconds"),
     "min_cycle_interval_seconds": ("scheduling", "min_cycle_interval_seconds"),
     "context_renderer": ("context", "renderer"),
-    "max_context_messages": ("context", "max_messages_per_cycle"),
+    "max_context_tokens": ("context", "max_context_tokens"),
+    "rotation_retention_ratio": ("context", "rotation_retention_ratio"),
     "max_log_records": ("context", "max_log_records"),
     "max_text_chars": ("context", "max_text_chars"),
     "record_self_messages": ("context", "record_self_messages"),
@@ -90,7 +92,8 @@ CONFIG_DEFAULTS = {
     "direct_delay_seconds": 1.0,
     "min_cycle_interval_seconds": 10.0,
     "context_renderer": "legacy_delta",
-    "max_context_messages": 200,
+    "max_context_tokens": 8192,
+    "rotation_retention_ratio": 0.5,
     "max_log_records": 10000,
     "max_text_chars": 4000,
     "record_self_messages": False,
@@ -130,6 +133,7 @@ class GroupAgentFlowPlugin(Star):
             QQActionGateway(),
             terminal_callback=self._finalize_terminal_observation,
             action_persist_callback=self._persist_agent_action,
+            action_admission_callback=self._admit_external_action,
         )
 
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -175,12 +179,35 @@ class GroupAgentFlowPlugin(Star):
         self,
         flow_id: str,
         record: dict[str, Any],
+        *,
+        run_id: str,
+        generation: int,
     ) -> int:
         """写入动作事实，并将其纳入已经存在的下一快照。"""
         async with self._lock_for(flow_id):
+            if not self.coordinator.is_run_current(
+                run_id,
+                flow_id=flow_id,
+                generation=generation,
+            ):
+                raise RuntimeError("stale autonomous group run")
             seq = self.store.append_record(flow_id, record)
             self.coordinator.include_pending_seq(flow_id, seq)
             return seq
+
+    async def _admit_external_action(
+        self,
+        flow_id: str,
+        run_id: str,
+        generation: int,
+    ) -> bool:
+        """在群锁内确认外部动作仍属于当前运行。"""
+        async with self._lock_for(flow_id):
+            return self.coordinator.is_run_current(
+                run_id,
+                flow_id=flow_id,
+                generation=generation,
+            )
 
     def _is_authorized(self, event: AstrMessageEvent) -> bool:
         """检查群白名单，其中 `*` 表示允许所有群。"""
@@ -283,10 +310,11 @@ class GroupAgentFlowPlugin(Star):
             delay = due_at - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
-            snapshot = self.coordinator.begin_if_due(
-                flow_id,
-                now=time.monotonic(),
-            )
+            async with self._lock_for(flow_id):
+                snapshot = self.coordinator.begin_if_due(
+                    flow_id,
+                    now=time.monotonic(),
+                )
             if snapshot is None:
                 await asyncio.sleep(0.05)
                 continue
@@ -296,6 +324,7 @@ class GroupAgentFlowPlugin(Star):
             event.set_extra(RUN_ID_EXTRA, snapshot.run_id)
             event.set_extra(FLOW_ID_EXTRA, snapshot.flow_id)
             event.set_extra(SNAPSHOT_SEQ_EXTRA, snapshot.snapshot_seq)
+            event.set_extra(RUN_GENERATION_EXTRA, snapshot.generation)
             event.set_extra("enable_streaming", False)
             isolate_platform_metadata(event)
             install_send_guard(event)
@@ -312,17 +341,31 @@ class GroupAgentFlowPlugin(Star):
                     system_prompt=self._system_prompt(),
                 )
             finally:
-                self.coordinator.finish(snapshot.run_id, finished_at=time.monotonic())
+                self.coordinator.finish_if_active(
+                    snapshot.run_id,
+                    finished_at=time.monotonic(),
+                )
 
     @filter.on_llm_request(priority=maxsize - 20)
     async def inject_snapshot(self, event: AstrMessageEvent, req: ProviderRequest):
-        """将 cursor 到冻结快照之间的增量追加到原生 LLM 请求。"""
+        """用持久化 observation 窗口替换原生会话上下文。"""
         if not event.get_extra(AUTONOMOUS_EXTRA, False) or not req.conversation:
             return
         flow_id = str(event.get_extra(FLOW_ID_EXTRA, "") or "")
         snapshot_seq = int(event.get_extra(SNAPSHOT_SEQ_EXTRA, 0) or 0)
+        run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
+        generation = int(event.get_extra(RUN_GENERATION_EXTRA, -1) or 0)
         default_renderer = str(self._cfg("context_renderer", "legacy_delta"))
+        req.contexts = []
+        req.conversation.token_usage = 0
         async with self._lock_for(flow_id):
+            if not self.coordinator.is_run_current(
+                run_id,
+                flow_id=flow_id,
+                generation=generation,
+            ):
+                event.stop_event()
+                return
             # 每个会话固定使用一个 renderer，避免同一实验混入不同上下文格式。
             renderer_name = self.store.get_or_assign_renderer(
                 flow_id,
@@ -335,7 +378,10 @@ class GroupAgentFlowPlugin(Star):
                 conversation_id=req.conversation.cid,
                 snapshot_seq=snapshot_seq,
                 renderer_name=renderer_name,
-                max_messages=int(self._cfg("max_context_messages", 200) or 0),
+                max_context_tokens=int(self._cfg("max_context_tokens", 8192) or 0),
+                rotation_retention_ratio=float(
+                    self._cfg("rotation_retention_ratio", 0.5) or 0.5
+                ),
             )
             pending = {
                 "flow_id": flow_id,
@@ -344,6 +390,8 @@ class GroupAgentFlowPlugin(Star):
                 "renderer": prepared.renderer_name,
                 "count": len(prepared.source_seqs),
                 "skipped": prepared.skipped_count,
+                "estimated_tokens": prepared.estimated_tokens,
+                "window_blocks": prepared.window_blocks,
             }
             event.set_extra(PENDING_CURSOR_EXTRA, pending)
             if not prepared.source_seqs:
@@ -355,11 +403,16 @@ class GroupAgentFlowPlugin(Star):
                         snapshot_seq=snapshot_seq,
                         outcome="empty_snapshot_skipped",
                     )
-                self.store.set_cursor(
+                self.store.commit_observation(
                     flow_id,
                     req.conversation.cid,
                     prepared.target_cursor,
                     unified_msg_origin=event.unified_msg_origin,
+                    renderer_name=prepared.renderer_name,
+                    blocks=[
+                        {"start_seq": start_seq, "end_seq": end_seq}
+                        for start_seq, end_seq in prepared.window_blocks
+                    ],
                 )
         if not prepared.source_seqs:
             if bool(self._cfg("debug_log", False)):
@@ -370,7 +423,7 @@ class GroupAgentFlowPlugin(Star):
                 )
             event.stop_event()
             return
-        req.contexts.extend(prepared.contexts)
+        req.contexts = list(prepared.contexts)
         req.func_tool = self.tool_runtime.build_tool_set()
         if bool(self._cfg("debug_log", False)):
             logger.debug(
@@ -417,31 +470,45 @@ class GroupAgentFlowPlugin(Star):
         run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
         flow_id = str(event.get_extra(FLOW_ID_EXTRA, "") or "")
         snapshot_seq = int(event.get_extra(SNAPSHOT_SEQ_EXTRA, 0) or 0)
+        generation = int(event.get_extra(RUN_GENERATION_EXTRA, -1) or 0)
         external_actions = event.get_extra(EXTERNAL_ACTIONS_EXTRA, [])
         if not isinstance(external_actions, list):
             external_actions = []
-        if run_id:
-            outcome = classify_run_outcome(
-                external_actions,
-                silence_selected=bool(event.get_extra(SILENCE_SELECTED_EXTRA, False)),
-                had_direct_output=had_direct_output,
-            )
-            self.store.record_run_outcome(
+        pending = event.get_extra(PENDING_CURSOR_EXTRA, {})
+        async with self._lock_for(flow_id):
+            if not self.coordinator.is_run_current(
                 run_id,
                 flow_id=flow_id,
-                snapshot_seq=snapshot_seq,
-                outcome=outcome,
-                detail=_external_action_outcome_detail(external_actions),
-            )
-        pending = event.get_extra(PENDING_CURSOR_EXTRA, {})
-        if isinstance(pending, dict) and pending.get("conversation_id"):
-            # 收到响应后再推进 cursor，避免失败请求导致消息丢失。
-            async with self._lock_for(flow_id):
-                self.store.set_cursor(
+                generation=generation,
+            ):
+                return
+            if run_id:
+                outcome = classify_run_outcome(
+                    external_actions,
+                    silence_selected=bool(
+                        event.get_extra(SILENCE_SELECTED_EXTRA, False)
+                    ),
+                    had_direct_output=had_direct_output,
+                )
+                self.store.record_run_outcome(
+                    run_id,
+                    flow_id=flow_id,
+                    snapshot_seq=snapshot_seq,
+                    outcome=outcome,
+                    detail=_external_action_outcome_detail(external_actions),
+                )
+            if isinstance(pending, dict) and pending.get("conversation_id"):
+                # 收到响应后再推进 cursor，避免失败请求导致消息丢失。
+                self.store.commit_observation(
                     flow_id,
                     str(pending["conversation_id"]),
                     int(pending.get("target_seq") or snapshot_seq),
                     unified_msg_origin=event.unified_msg_origin,
+                    renderer_name=str(pending.get("renderer") or ""),
+                    blocks=[
+                        {"start_seq": int(start), "end_seq": int(end)}
+                        for start, end in pending.get("window_blocks", ())
+                    ],
                 )
 
     @filter.on_agent_begin(priority=maxsize - 20)
@@ -505,5 +572,6 @@ class GroupAgentFlowPlugin(Star):
             return
         flow_id = f"{event.get_platform_id()}:group:{event.get_group_id()}"
         async with self._lock_for(flow_id):
+            self.coordinator.clear_flow(flow_id)
             self.store.clear_flow(flow_id)
         yield event.plain_result("Group Agent Flow data cleared for this group.")

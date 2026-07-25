@@ -47,6 +47,7 @@ def test_renderer_values_and_default_remain_stable():
         "legacy_delta",
         "plain_lines",
         "native_messages",
+        "xml_delta",
     ]
     assert renderer["default"] == "legacy_delta"
 
@@ -76,12 +77,15 @@ def test_renderer_labels_describe_the_actual_message_structure():
         "Aggregated Delta Block (Dash-separated)",
         "Aggregated Delta Block (Line-separated)",
         "Dedicated User Block per Message",
+        "XML Delta Block (Structured Components)",
     ]
     assert zh["config"]["context"]["renderer"]["labels"] == [
         "聚合增量块（短线分隔）",
         "聚合增量块（换行分隔）",
         "逐消息独占 User 块",
+        "XML 增量块（结构化组件）",
     ]
     assert en["config"]["context"]["renderer"]["labels"] == renderer["labels"]
     assert "<group_messages_delta>" in zh["config"]["context"]["renderer"]["hint"]
     assert "role=user" in zh["config"]["context"]["renderer"]["hint"]
+    assert "XML" in zh["config"]["context"]["renderer"]["hint"]

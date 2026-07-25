@@ -22,6 +22,9 @@ def _component_record(component: Any) -> dict[str, Any]:
             "type": "reply",
             "message_id": _value(component.id),
             "sender_id": _value(component.sender_id),
+            "sender_name": _value(component.sender_nickname),
+            "timestamp": _value(component.time),
+            "text": _value(component.message_str),
         }
     if isinstance(component, Comp.At):
         return {

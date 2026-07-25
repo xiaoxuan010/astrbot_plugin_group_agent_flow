@@ -35,8 +35,9 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 - 聚合增量块（短线分隔，`legacy_delta`）：生成一个 User 块，使用 `<group_messages_delta>` 包装，消息之间以 `---` 分隔。
 - 聚合增量块（换行分隔，`plain_lines`）：生成一个 User 块，每条群消息占一行，包含发送者、时间和消息 ID。
 - 逐消息独占 User 块（`native_messages`）：每条群消息分别生成一条 `role=user` 消息，保留模型请求中的消息边界。
+- XML 增量块（结构化组件，`xml_delta`）：生成一个 User 块，使用 `<group_messages_delta>` 在外层传递群号和群名，内部以 XML 表达消息、机器人动作、引用、提及、文本和媒体组件。
 
-三个 option value 为兼容已保存配置保持不变。`---` 是人为分隔协议，提供比普通换行更明显的
+四个 option value 为兼容已保存配置保持不变。`---` 是人为分隔协议，提供比普通换行更明显的
 记录边界；仓库中尚无模型评测能确定最优格式。renderer 会在某个 conversation 首次运行时固定，
 修改默认值只影响新 conversation，方便对三种格式进行独立对照。
 

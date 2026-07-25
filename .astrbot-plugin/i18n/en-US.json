@@ -30,8 +30,8 @@
       "description": "Persisted context and rendering",
       "renderer": {
         "description": "Context renderer for newly assigned conversations",
-        "hint": "Aggregated Delta Block (Dash-separated) uses one user message wrapped in <group_messages_delta> with --- separators; Aggregated Delta Block (Line-separated) joins structured event lines with newlines; Dedicated User Block per Message creates a separate role=user block for each event.",
-        "labels": ["Aggregated Delta Block (Dash-separated)", "Aggregated Delta Block (Line-separated)", "Dedicated User Block per Message"]
+        "hint": "Aggregated Delta Block (Dash-separated) uses one user message wrapped in <group_messages_delta> with --- separators; Aggregated Delta Block (Line-separated) joins structured event lines with newlines; Dedicated User Block per Message creates a separate role=user block for each event; XML Delta Block (Structured Components) uses one <group_messages_delta> with outer group metadata and structured event components.",
+        "labels": ["Aggregated Delta Block (Dash-separated)", "Aggregated Delta Block (Line-separated)", "Dedicated User Block per Message", "XML Delta Block (Structured Components)"]
       },
       "max_context_tokens": {
         "description": "Maximum observation context tokens",

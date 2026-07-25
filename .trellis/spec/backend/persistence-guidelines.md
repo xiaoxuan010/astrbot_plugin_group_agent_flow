@@ -125,6 +125,52 @@ Correct: admit the current run under the flow lock, append a typed action fact t
 ordered JSONL source after the side effect, extend only an existing pending snapshot, then let
 the unified finalizer commit state for the same generation.
 
+## Scenario: Structured XML observation projection
+
+### 1. Scope / Trigger
+
+`context.renderer=xml_delta` projects one frozen observation into one XML `role=user` block. The projection consumes persisted JSONL `components`, so component fields are a storage-to-provider contract.
+
+### 2. Signatures
+
+- `_component_record(component) -> dict[str, Any]`
+- `XmlDeltaRenderer.render(events: list[dict[str, Any]]) -> list[dict[str, Any]]`
+
+### 3. Contracts
+
+- The outer element is `<group_messages_delta group_id="…" group_name="…">`; `group_id` and `group_name` each use the first non-empty value in the batch.
+- Inbound `Reply` components persist `message_id`, `sender_id`, `sender_name`, `timestamp`, and `text`. The three latter fields are optional for old JSONL records.
+- `at` maps to `<mention>`; `user_id="all"` maps to `<mention all="true"/>`.
+- `text`, `reply`, `image`, `face`, `poke`, `voice`, `video`, and `file` retain their component boundary and JSONL order. Unknown types map to `<component type="…"/>`.
+- Every dynamic XML attribute and text node is escaped. Existing media URLs or local paths remain XML attributes; renderer projection does not attach binary media to the Provider request.
+
+### 4. Validation & Error Matrix
+
+- Empty event list -> `[]`.
+- Empty optional component field -> omit its XML attribute.
+- Old Reply without new fields -> emit available `message_id` and `sender_id`; omit the missing attributes and nested text.
+- Replayed action with empty `group_name` before a later group message -> use the later non-empty group name on the outer element.
+- Unknown component -> `<component type="…"/>`; no renderer exception.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a reply, mention, image, and text retain their order under one `<message>` element.
+- Base: a historic JSONL reply with only ID fields remains model-visible as a self-closing `<reply>` element.
+- Bad: deriving group metadata only from the first record causes empty `group_name` when replayed actions precede the current message.
+
+### 6. Tests Required
+
+- Codec test asserts new Reply fields serialize from AstrBot's `Reply` component.
+- Renderer test asserts outer metadata, XML escaping, component ordering, all supported media types, all-mention, unknown fallback, and action metadata.
+- Renderer regression test puts an empty-name action before a named group message and asserts the outer group name comes from the latter.
+- i18n test asserts `xml_delta` and both localized labels/hints stay aligned with schema options.
+
+### 7. Wrong vs Correct
+
+Wrong: parse `[引用消息(...)]` or `[At:...]` from the flattened AstrBot outline to reconstruct XML.
+
+Correct: persist the structured component fields at ingestion, then render them directly in XML.
+
 ## Scenario: A token-bounded observation window is committed
 
 ### 1. Scope / Trigger

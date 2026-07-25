@@ -14,7 +14,13 @@ class FakeEvent:
             group=SimpleNamespace(group_name="测试群"),
         )
         self._messages = [
-            Comp.Reply(id="msg-199", sender_id="10000", message_str="上一条"),
+            Comp.Reply(
+                id="msg-199",
+                sender_id="10000",
+                sender_nickname="Quoted",
+                time=1710000000,
+                message_str="上一条",
+            ),
             Comp.At(qq="7", name="Bot"),
             Comp.Plain("正文"),
             Comp.Image(file="https://example.com/image.jpg"),
@@ -190,7 +196,14 @@ def test_extract_group_event_serializes_supported_components():
     record = extract_group_event(FakeEvent(), max_text_chars=4000)
 
     assert record["components"] == [
-        {"type": "reply", "message_id": "msg-199", "sender_id": "10000"},
+        {
+            "type": "reply",
+            "message_id": "msg-199",
+            "sender_id": "10000",
+            "sender_name": "Quoted",
+            "timestamp": "1710000000",
+            "text": "上一条",
+        },
         {"type": "at", "user_id": "7", "name": "Bot"},
         {"type": "text", "text": "正文"},
         {"type": "image", "url": "https://example.com/image.jpg"},

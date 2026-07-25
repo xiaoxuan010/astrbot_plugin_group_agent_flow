@@ -50,11 +50,18 @@
         "labels": ["Aggregated Delta Block (Dash-separated)", "Aggregated Delta Block (Line-separated)", "Dedicated User Block per Message"],
         "default": "legacy_delta"
       },
-      "max_messages_per_cycle": {
+      "max_context_tokens": {
         "type": "int",
-        "description": "Maximum new messages in one snapshot",
-        "hint": "0 keeps the complete unconsumed delta. Older messages remain searchable through tools.",
-        "default": 200
+        "description": "Maximum observation context tokens",
+        "hint": "Uses AstrBot Core's token counter. The latest observation block is trimmed first when it alone exceeds the budget; older records remain searchable through tools.",
+        "default": 8192
+      },
+      "rotation_retention_ratio": {
+        "type": "float",
+        "description": "Context retained after block rotation",
+        "hint": "When the token budget overflows, oldest complete blocks are removed until usage reaches this fraction. Runtime values are constrained to 0.1-0.9.",
+        "slider": {"min": 0.1, "max": 0.9, "step": 0.05},
+        "default": 0.5
       },
       "max_log_records": {
         "type": "int",

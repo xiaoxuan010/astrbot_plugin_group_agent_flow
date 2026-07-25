@@ -96,3 +96,50 @@ def test_message_arriving_after_an_unscheduled_action_covers_its_seq():
     coordinator.enqueue("group:1", seq=13, received_at=100.0, directed=False)
 
     assert coordinator.begin_if_due("group:1", now=100.0).snapshot_seq == 13
+
+
+def test_run_snapshot_freezes_generation_and_validates_active_identity():
+    coordinator = GroupRunCoordinator(debounce_seconds=0, direct_delay_seconds=0)
+    coordinator.enqueue("group:1", seq=1, received_at=100.0, directed=False)
+
+    snapshot = coordinator.begin_if_due("group:1", now=100.0)
+
+    assert snapshot.generation == 0
+    assert coordinator.is_run_current(
+        snapshot.run_id,
+        flow_id="group:1",
+        generation=0,
+    )
+    assert not coordinator.is_run_current(
+        snapshot.run_id,
+        flow_id="group:1",
+        generation=1,
+    )
+
+
+def test_clear_flow_invalidates_active_pending_and_frequency_state():
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=0,
+        direct_delay_seconds=0,
+        min_cycle_interval_seconds=100,
+    )
+    coordinator.enqueue("group:1", seq=1, received_at=100.0, directed=False)
+    old = coordinator.begin_if_due("group:1", now=100.0)
+    coordinator.enqueue("group:1", seq=2, received_at=101.0, directed=False)
+
+    generation = coordinator.clear_flow("group:1")
+
+    assert generation == 1
+    assert coordinator.next_due_at("group:1") is None
+    assert not coordinator.is_run_current(
+        old.run_id,
+        flow_id="group:1",
+        generation=old.generation,
+    )
+    assert coordinator.finish_if_active(old.run_id, finished_at=102.0) is False
+
+    coordinator.enqueue("group:1", seq=1, received_at=103.0, directed=False)
+    fresh = coordinator.begin_if_due("group:1", now=103.0)
+    assert fresh is not None
+    assert fresh.snapshot_seq == 1
+    assert fresh.generation == 1

@@ -33,9 +33,13 @@
         "hint": "聚合增量块（短线分隔）：单个 User 块，使用 <group_messages_delta> 包装并以 --- 分隔事件；聚合增量块（换行分隔）：单个 User 块，以换行分隔结构化事件；逐消息独占 User 块：每个群事件分别生成一条 role=user 消息。",
         "labels": ["聚合增量块（短线分隔）", "聚合增量块（换行分隔）", "逐消息独占 User 块"]
       },
-      "max_messages_per_cycle": {
-        "description": "每轮最大新增消息数",
-        "hint": "0 表示保留全部未消费增量。更早消息仍可通过历史工具检索。"
+      "max_context_tokens": {
+        "description": "观察上下文最大 token 数",
+        "hint": "使用 AstrBot Core 的 token 计数器。最新观察块单独超限时会优先裁剪其中的旧记录；更早记录仍可通过历史工具检索。"
+      },
+      "rotation_retention_ratio": {
+        "description": "块轮转后的上下文保留比例",
+        "hint": "token 预算溢出时，从最旧完整块开始移除，直至用量降到该比例。运行时取值范围为 0.1-0.9。"
       },
       "max_log_records": {
         "description": "每群最大持久化记录数",

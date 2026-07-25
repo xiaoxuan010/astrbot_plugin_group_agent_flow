@@ -155,3 +155,121 @@ def test_cursor_never_moves_backwards_when_a_stale_run_finishes(tmp_path):
     store.set_cursor(flow_id, "conv", 43, unified_msg_origin="qq:GroupMessage:1")
 
     assert store.get_cursor(flow_id, "conv") == 44
+
+
+def test_observation_window_survives_reload_with_validated_blocks(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+
+    store.set_observation_window(
+        flow_id,
+        "conv",
+        renderer_name="plain_lines",
+        blocks=[
+            {"start_seq": 10, "end_seq": 20},
+            {"start_seq": 21, "end_seq": 25},
+        ],
+    )
+
+    assert GroupFlowStore(tmp_path).get_observation_window(flow_id, "conv") == {
+        "renderer": "plain_lines",
+        "blocks": [
+            {"start_seq": 10, "end_seq": 20},
+            {"start_seq": 21, "end_seq": 25},
+        ],
+    }
+
+
+def test_observation_cursor_and_window_commit_in_one_state_write(
+    tmp_path,
+    monkeypatch,
+):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    writes = []
+    original_write = store.write_state
+
+    def track_write(state):
+        writes.append(state)
+        original_write(state)
+
+    monkeypatch.setattr(store, "write_state", track_write)
+
+    store.commit_observation(
+        flow_id,
+        "conv",
+        7,
+        unified_msg_origin="qq:GroupMessage:1",
+        renderer_name="plain_lines",
+        blocks=[{"start_seq": 3, "end_seq": 7}],
+    )
+
+    assert len(writes) == 1
+    assert store.get_cursor(flow_id, "conv") == 7
+    assert store.get_observation_window(flow_id, "conv") == {
+        "renderer": "plain_lines",
+        "blocks": [{"start_seq": 3, "end_seq": 7}],
+    }
+
+
+def test_observation_window_rejects_malformed_or_overlapping_blocks(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    key = store._cursor_key(flow_id, "conv")
+    store.write_state(
+        {
+            "observation_windows": {
+                key: {
+                    "renderer": "plain_lines",
+                    "blocks": [
+                        {"start_seq": 10, "end_seq": 20},
+                        {"start_seq": 20, "end_seq": 25},
+                    ],
+                }
+            }
+        }
+    )
+
+    assert store.get_observation_window(flow_id, "conv") is None
+
+
+def test_clear_flow_removes_window_and_run_outcomes_for_only_that_flow(tmp_path):
+    first = "qq:group:1"
+    second = "qq:group:2"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(first, _record("m1", "alice", "first", 1))
+    store.set_cursor(first, "conv", 1, unified_msg_origin="qq:GroupMessage:1")
+    store.get_or_assign_renderer(first, "conv", "plain_lines")
+    store.set_observation_window(
+        first,
+        "conv",
+        renderer_name="plain_lines",
+        blocks=[{"start_seq": 1, "end_seq": 1}],
+    )
+    store.set_observation_window(
+        second,
+        "conv",
+        renderer_name="native_messages",
+        blocks=[{"start_seq": 5, "end_seq": 6}],
+    )
+    store.record_run_outcome(
+        "run-first",
+        flow_id=first,
+        snapshot_seq=1,
+        outcome="no_action",
+    )
+    store.record_run_outcome(
+        "run-second",
+        flow_id=second,
+        snapshot_seq=6,
+        outcome="no_action",
+    )
+
+    store.clear_flow(first)
+
+    assert store.read_records(first) == []
+    assert store.get_cursor(first, "conv") == 0
+    assert store.get_observation_window(first, "conv") is None
+    assert store.get_run_outcome("run-first") is None
+    assert store.get_observation_window(second, "conv") is not None
+    assert store.get_run_outcome("run-second") is not None

@@ -17,12 +17,18 @@
 - Empty renderer input produces no user message. A stale or contentless snapshot stops in
   `OnLLMRequestEvent` before the Provider receives a request, and cursor updates remain
   monotonic across delayed runs.
+- Replace AstrBot conversation contexts with the plugin observation window and reset
+  conversation token usage before Provider request preparation.
 - Preserve structured message metadata in storage even when a renderer projects it to text.
 - Persist each successful external action as a typed, non-targetable fact before committing the
   terminal cursor. Extend an existing pending snapshot with the action seq without creating a
   second scheduling path.
-- Replay recent consumed action facts from JSONL whenever a new delta exists, bounded by the
-  existing cycle message limit, so consecutive terminal cycles retain completed-action context.
+- Build stable observation blocks from both group messages and agent actions in JSONL order.
+  Use Core `EstimateTokenCounter`, the configured hard token budget, and bulk oldest-block
+  rotation. Keep earlier facts accessible through snapshot-bounded history tools.
+- Validate run generation under the per-flow lock before gateway admission, fact persistence,
+  and terminal state writes. Clear persistent and coordinator flow state in the same critical
+  section.
 - Keep `.astrbot-plugin/i18n/zh-CN.json` and `en-US.json` aligned with
   `_conf_schema.json`: every section and field has a localized `description`, schema
   `hint` and `labels` entries have matching localized entries, and translated labels
@@ -56,8 +62,11 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
   pending upper bound to the action seq; an action with no pending message remains unscheduled.
 - Inbound `append_record()` and coordinator `enqueue()` execute under one per-flow lock, so every
   action ordering is covered by the next valid pending snapshot.
-- Two consecutive observations after cursor advancement both include the prior action fact; an
-  empty delta remains empty and does not schedule work from action memory alone.
+- Two consecutive observations reuse the same rendered historical block prefix and append the
+  new block at the tail. An empty delta remains empty and does not schedule work from history.
+- Overflow removes multiple oldest blocks toward the configured retention ratio. A latest-only
+  block remains within the hard token budget and preserves a recovery marker for oversized
+  single records.
 - Multiple external actions from one Provider tool batch may execute in declared order; the
   batch ends without a follow-up Provider request. Each callback recomputes the same run outcome
   from the full accumulated action list. No tool call ends as a persisted no-action outcome.
@@ -70,6 +79,8 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
   outcome and cursor, preventing a follow-up Provider request.
 - A delayed snapshot already covered by cursor records `empty_snapshot_skipped`, assigns no
   tools, and makes no Provider request.
+- `/gaf_clear` invalidates pending and active runs. Old runs perform no later state writes;
+  actions rejected after clear make zero gateway calls.
 - `_conf_schema.json`, defaults, metadata, README, and migration behavior remain aligned.
 - Both plugin locale files parse successfully and pass schema coverage tests after any
   metadata or configuration-schema text change.

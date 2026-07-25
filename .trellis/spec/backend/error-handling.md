@@ -18,6 +18,8 @@ Use exceptions for invalid internal state and unsupported capabilities:
 - `build_renderer()` raises `ValueError` for an unknown renderer.
 - `QQActionGateway` raises `ValueError` for missing owner configuration and `RuntimeError`
   when the current platform lacks a required QQ API.
+- Observation preparation raises `ValueError` when `max_context_tokens` cannot contain the
+  minimum record metadata and `get_message` recovery marker.
 
 Tests should assert the specific exception or error code. Do not convert programmer errors
 into silent success.
@@ -84,6 +86,9 @@ Different Providers use that field for role-play replies or control statements s
   detail followed by terminal `None`.
 - Invalid snapshot target before a gateway attempt -> structured JSON error; the model may
   choose a valid target in a later step.
+- Stale run before gateway admission -> terminal failed action with `stale_run`; zero QQ calls.
+- Run cleared after gateway admission -> completed QQ side effect plus
+  `fact_persist_failed:RuntimeError`; stale terminal state writes are ignored.
 - `stay_silent` outside an autonomous run ->
   `RuntimeError("tool called outside an autonomous group run")`.
 - `stay_silent` after read-only tools -> terminal `silence_selected`; no QQ send.

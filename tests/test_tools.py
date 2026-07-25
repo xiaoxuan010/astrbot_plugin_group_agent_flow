@@ -36,6 +36,7 @@ class FakeEvent:
             "_group_agent_run_id": "run-1",
             "_group_agent_flow_id": "napcat:group:1",
             "_group_agent_snapshot_seq": 5,
+            "_group_agent_run_generation": 0,
         }
         self.result = None
 
@@ -380,7 +381,15 @@ async def test_action_encoding_failure_is_terminal_after_successful_send(
 async def test_action_persistence_failure_is_terminal_after_successful_send(tmp_path):
     finalized = []
 
-    async def fail_persist(_flow_id, _record):
+    async def fail_persist(
+        _flow_id,
+        _record,
+        *,
+        run_id,
+        generation,
+    ):
+        assert run_id == "run-1"
+        assert generation == 0
         raise OSError("disk full")
 
     async def finalize(event):
@@ -407,6 +416,86 @@ async def test_action_persistence_failure_is_terminal_after_successful_send(tmp_
             "action_name": "send_message",
             "status": "succeeded",
             "detail": "fact_persist_failed:OSError",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stale_run_is_rejected_before_external_gateway_call(tmp_path):
+    admissions = []
+    persisted = []
+
+    async def reject(flow_id, run_id, generation):
+        admissions.append((flow_id, run_id, generation))
+        return False
+
+    async def persist(flow_id, record, *, run_id, generation):
+        persisted.append((flow_id, record, run_id, generation))
+        return 1
+
+    runtime = ToolRuntime(
+        GroupFlowStore(tmp_path),
+        QQActionGateway(),
+        action_admission_callback=reject,
+        action_persist_callback=persist,
+    )
+    event = FakeEvent()
+
+    result = await runtime.build_tool_set().get_tool("send_message").handler(
+        event,
+        content="stale",
+    )
+
+    assert result is None
+    assert admissions == [("napcat:group:1", "run-1", 0)]
+    assert event.sent == []
+    assert persisted == []
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": "send_message",
+            "status": "failed",
+            "detail": "stale_run",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_admitted_gateway_action_can_finish_while_stale_fact_is_rejected(
+    tmp_path,
+):
+    admitted = []
+    persisted = []
+
+    async def admit(flow_id, run_id, generation):
+        admitted.append((flow_id, run_id, generation))
+        return True
+
+    async def reject_stale_fact(flow_id, record, *, run_id, generation):
+        persisted.append((flow_id, record, run_id, generation))
+        raise RuntimeError("stale autonomous group run")
+
+    runtime = ToolRuntime(
+        GroupFlowStore(tmp_path),
+        QQActionGateway(),
+        action_admission_callback=admit,
+        action_persist_callback=reject_stale_fact,
+    )
+    event = FakeEvent()
+
+    result = await runtime.build_tool_set().get_tool("send_message").handler(
+        event,
+        content="already admitted",
+    )
+
+    assert result is None
+    assert admitted == [("napcat:group:1", "run-1", 0)]
+    assert len(event.sent) == 1
+    assert len(persisted) == 1
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": "send_message",
+            "status": "succeeded",
+            "detail": "fact_persist_failed:RuntimeError",
         }
     ]
 

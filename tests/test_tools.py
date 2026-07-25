@@ -65,7 +65,7 @@ class FakeEvent:
         self.sent.append(chain)
 
 
-class TerminalActionProvider(Provider):
+class ConsecutiveActionProvider(Provider):
     def __init__(self):
         super().__init__({}, {})
         self.call_count = 0
@@ -81,6 +81,22 @@ class TerminalActionProvider(Provider):
 
     async def text_chat(self, **_kwargs):
         self.call_count += 1
+        if self.call_count == 2:
+            return LLMResponse(
+                role="assistant",
+                tools_call_name=["send_message"],
+                tools_call_args=[{"content": "再发一次"}],
+                tools_call_ids=["call-2"],
+                usage=TokenUsage(input_other=10, output=5),
+            )
+        if self.call_count == 3:
+            return LLMResponse(
+                role="assistant",
+                tools_call_name=["stay_silent"],
+                tools_call_args=[{}],
+                tools_call_ids=["call-3"],
+                usage=TokenUsage(input_other=10, output=5),
+            )
         return LLMResponse(
             role="assistant",
             tools_call_name=["send_message"],
@@ -168,8 +184,8 @@ async def test_multiple_external_actions_execute_in_one_run(tmp_path):
         content="点好啦",
     )
 
-    assert reacted is None
-    assert replied is None
+    assert reacted == '{"success":true,"action":"react_message"}'
+    assert replied == '{"success":true,"action":"reply_message"}'
     assert event.bot.actions[0][0] == "set_msg_emoji_like"
     assert len(event.sent) == 1
     assert [
@@ -189,7 +205,7 @@ async def test_multiple_external_actions_execute_in_one_run(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_external_message_tool_returns_astrbot_terminal_signal(tmp_path):
+async def test_external_message_tool_returns_structured_result_without_finalizing(tmp_path):
     finalized = []
 
     async def finalize(event):
@@ -215,9 +231,10 @@ async def test_external_message_tool_returns_astrbot_terminal_signal(tmp_path):
         )
     ]
 
-    assert results == [None]
+    assert len(results) == 1
+    assert results[0].content[0].text == '{"success":true,"action":"send_message"}'
     assert len(event.sent) == 1
-    assert finalized == [event]
+    assert finalized == []
     assert event.get_extra("_group_agent_external_actions") == [
         {"action_name": "send_message", "status": "succeeded", "detail": ""}
     ]
@@ -229,11 +246,11 @@ async def test_external_message_tool_returns_astrbot_terminal_signal(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_terminal_action_stops_runner_without_another_provider_call(tmp_path):
+async def test_external_action_allows_follow_up_provider_call_until_stay_silent(tmp_path):
     store = GroupFlowStore(tmp_path)
     runtime = ToolRuntime(store, QQActionGateway())
     event = FakeEvent()
-    provider = TerminalActionProvider()
+    provider = ConsecutiveActionProvider()
     request = ProviderRequest(
         prompt="respond",
         func_tool=runtime.build_tool_set(),
@@ -255,10 +272,11 @@ async def test_terminal_action_stops_runner_without_another_provider_call(tmp_pa
         pass
 
     assert runner.done() is True
-    assert provider.call_count == 1
-    assert len(event.sent) == 1
+    assert provider.call_count == 3
+    assert len(event.sent) == 2
     assert [record["action_name"] for record in store.read_records("napcat:group:1")] == [
-        "send_message"
+        "send_message",
+        "send_message",
     ]
 
 
@@ -304,7 +322,7 @@ async def test_stay_silent_marks_cycle_and_returns_terminal_signal(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_external_action_is_terminal_and_records_failure(tmp_path):
+async def test_failed_external_action_returns_structured_error_and_records_failure(tmp_path):
     store = GroupFlowStore(tmp_path)
     runtime = ToolRuntime(store, QQActionGateway())
     event = FakeEvent()
@@ -322,7 +340,7 @@ async def test_failed_external_action_is_terminal_and_records_failure(tmp_path):
         )
     )
 
-    assert result is None
+    assert result == '{"success":false,"action":"send_message","error":"RuntimeError"}'
     assert event.get_extra("_group_agent_external_actions") == [
         {
             "action_name": "send_message",
@@ -334,7 +352,7 @@ async def test_failed_external_action_is_terminal_and_records_failure(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_action_encoding_failure_is_terminal_after_successful_send(
+async def test_action_encoding_failure_returns_successful_result_after_send(
     tmp_path,
     monkeypatch,
 ):
@@ -364,9 +382,10 @@ async def test_action_encoding_failure_is_terminal_after_successful_send(
         content="A",
     )
 
-    assert result is None
+    assert result == ('{"success":true,"action":"send_message",'
+                      '"fact_error":"fact_encode_failed:ValueError"}')
     assert len(event.sent) == 1
-    assert finalized == [event]
+    assert finalized == []
     assert store.read_records("napcat:group:1") == []
     assert event.get_extra("_group_agent_external_actions") == [
         {
@@ -378,7 +397,7 @@ async def test_action_encoding_failure_is_terminal_after_successful_send(
 
 
 @pytest.mark.asyncio
-async def test_action_persistence_failure_is_terminal_after_successful_send(tmp_path):
+async def test_action_persistence_failure_returns_successful_result_after_send(tmp_path):
     finalized = []
 
     async def fail_persist(
@@ -408,9 +427,10 @@ async def test_action_persistence_failure_is_terminal_after_successful_send(tmp_
         content="A",
     )
 
-    assert result is None
+    assert result == ('{"success":true,"action":"send_message",'
+                      '"fact_error":"fact_persist_failed:OSError"}')
     assert len(event.sent) == 1
-    assert finalized == [event]
+    assert finalized == []
     assert event.get_extra("_group_agent_external_actions") == [
         {
             "action_name": "send_message",
@@ -446,7 +466,7 @@ async def test_stale_run_is_rejected_before_external_gateway_call(tmp_path):
         content="stale",
     )
 
-    assert result is None
+    assert result == '{"success":false,"action":"send_message","error":"stale_run"}'
     assert admissions == [("napcat:group:1", "run-1", 0)]
     assert event.sent == []
     assert persisted == []
@@ -487,7 +507,10 @@ async def test_admitted_gateway_action_can_finish_while_stale_fact_is_rejected(
         content="already admitted",
     )
 
-    assert result is None
+    assert result == (
+        '{"success":true,"action":"send_message",'
+        '"fact_error":"fact_persist_failed:RuntimeError"}'
+    )
     assert admitted == [("napcat:group:1", "run-1", 0)]
     assert len(event.sent) == 1
     assert len(persisted) == 1
@@ -642,7 +665,9 @@ async def test_poke_user_only_targets_users_observed_in_frozen_snapshot(tmp_path
     tools = ToolRuntime(store, QQActionGateway()).build_tool_set()
 
     for user_id in ("alice", "bob", "carol"):
-        assert await tools.get_tool("poke_user").handler(event, user_id=user_id) is None
+        assert await tools.get_tool("poke_user").handler(
+            event, user_id=user_id
+        ) == '{"success":true,"action":"poke_user"}'
     rejected = json.loads(
         await tools.get_tool("poke_user").handler(event, user_id="future")
     )

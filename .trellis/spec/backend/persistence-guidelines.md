@@ -43,13 +43,13 @@ every persistence contract change.
 Avoid ad hoc file writes, path names derived directly from QQ IDs, and cursor advancement
 beyond the run's `snapshot_seq`.
 
-## Scenario: A terminal action enters the group fact stream
+## Scenario: An external action enters the group fact stream
 
 ### 1. Scope / Trigger
 
-An autonomous QQ action succeeds and returns AstrBot's terminal `None`. The action must remain
-visible to later observation cycles even when AstrBot conversation history skips that terminal
-tool call/result.
+An autonomous QQ action succeeds and returns a structured tool result. The action must remain
+visible to later observation cycles even when AstrBot conversation history is compacted or a
+later Provider step ends the run.
 
 ### 2. Signatures
 
@@ -66,7 +66,7 @@ tool call/result.
   `message_id="agent-action:{run_id}:{action_index}"`, `targetable=false`, bot sender identity,
   structured components, action target, `action_status="succeeded"`, and the originating run.
 - `schema_version=2` identifies the shared envelope; `record_kind` identifies record semantics.
-- The plugin appends the action under the per-flow lock before the terminal callback commits
+- The plugin appends the action under the per-flow lock before the unified run finalizer commits
   the original `snapshot_seq` cursor.
 - The plugin validates `(flow_id, run_id, generation)` under the per-flow lock before gateway
   admission and again before appending the action fact.
@@ -83,9 +83,9 @@ tool call/result.
 
 - Gateway failure -> failed run action; no `agent_action` record.
 - Gateway success plus action encoding failure -> successful run action with
-  `fact_encode_failed:<ExceptionType>`; terminal `None`; no QQ retry.
+  `fact_encode_failed:<ExceptionType>` in its structured result; no QQ retry.
 - Gateway success plus JSONL write failure -> successful run action with
-  `fact_persist_failed:<ExceptionType>`; terminal `None`; no QQ retry.
+  `fact_persist_failed:<ExceptionType>` in its structured result; no QQ retry.
 - Synthetic action ID passed to reply/react -> `message_not_found_in_snapshot`; zero gateway calls.
 - Action bot sender passed to poke validation -> excluded from the eligible user set.
 - Existing run ID with a different flow or snapshot -> outcome update rejected.
@@ -108,8 +108,8 @@ tool call/result.
 - Store tests reload mixed legacy/group/action records and verify same-run outcome updates plus
   cross-route rejection.
 - Coordinator tests cover message-before-action and action-before-message orderings.
-- Tool tests assert successful persistence, encode/write failures, terminal `None`, one Provider
-  call, readable history, and synthetic target rejection.
+- Tool tests assert successful persistence, encode/write failures, structured results, a
+  follow-up Provider call ending in `stay_silent`, readable history, and synthetic target rejection.
 - Renderer tests cover all four actions in all three renderer formats without exposing
   `msg=agent-action:...`.
 - Request-hook tests assert the next Provider context contains the completed action.
@@ -122,8 +122,8 @@ Wrong: save only `action_succeeded` in `state.json` and rely on AstrBot conversa
 adapter self-echoes to reconstruct the visible reply.
 
 Correct: admit the current run under the flow lock, append a typed action fact to the same
-ordered JSONL source after the side effect, extend only an existing pending snapshot, then
-commit terminal state for the same generation.
+ordered JSONL source after the side effect, extend only an existing pending snapshot, then let
+the unified finalizer commit state for the same generation.
 
 ## Scenario: A token-bounded observation window is committed
 

@@ -6,9 +6,9 @@ Read-only tools and validation failures return compact JSON strings. Expected fa
 stable `error` code such as `message_not_found_in_snapshot`, so the model can choose a valid
 follow-up. Keep these errors structured and free of tracebacks.
 
-`ToolRuntime._external()` executes an external action, records gateway success or failure,
-invokes the terminal state callback, and returns `None`. Both successful and failed gateway
-attempts are terminal for that Agent Loop, preventing duplicate sends during automatic retries.
+`ToolRuntime._external()` executes an external action, records gateway success or failure, and
+returns a compact structured result. The Agent Loop may continue; `stay_silent` is the explicit
+tool that invokes the terminal callback and returns `None`.
 
 ## Programming And Configuration Errors
 
@@ -37,7 +37,7 @@ Different Providers use that field for role-play replies or control statements s
 - `install_send_guard(event) -> None`
 - `record_external_action(event, *, action_name: str, success: bool, detail: str = "") -> None`
 - `suppress_direct_output(response, *, run_context=None) -> bool`
-- `ToolRuntime._external(event, action_name, operation) -> None`
+- `ToolRuntime._external(event, action_name, operation) -> str`
 - `build_agent_action_record(event, *, run_id, action_index, action_name, action_result) -> dict`
 - `stay_silent(event) -> None`
 - `classify_run_outcome(external_actions, *, silence_selected, had_direct_output) -> str`
@@ -57,16 +57,17 @@ Different Providers use that field for role-play replies or control statements s
   protocols and places the protocol at the end of `req.system_prompt` before Provider execution.
 - Explicit action tools call `tool_send()` through `QQActionGateway` and record the actual
   action name with `succeeded` or `failed` status.
-- A successful gateway result is encoded and persisted as `agent_action` before the terminal
-  callback. Encoding and write failures preserve the successful QQ result and attach only a
+- A successful gateway result is encoded and persisted as `agent_action` before its structured
+  tool result. Encoding and write failures preserve the successful QQ result and attach only a
   safe `fact_encode_failed:<type>` or `fact_persist_failed:<type>` diagnostic.
 - Multiple actions in one Provider tool batch update the same run outcome from the complete
   accumulated action list; success plus failure becomes `action_partial`.
 - A response containing content `A` and `send_message("B")` sends only `B`.
 - A pure final assistant response is cleared and its runtime message is marked `_no_save`.
 - Content attached to a tool call remains internal Provider history and never reaches QQ.
-- An attempted external action invokes the terminal callback, then returns `None` so AstrBot
-  ends the Agent Loop without another Provider request.
+- An attempted external action returns `{success, action}` or `{success:false, action, error}`;
+  a safe `fact_error` reports action-fact encoding or persistence failure. It leaves cursor
+  persistence to the unified response finalizer.
 - `stay_silent` sets `_group_agent_silence_selected=True`, invokes the same terminal callback,
   records `silence_selected`, advances the pending cursor, and returns terminal `None` without
   sending to QQ or appending `_group_agent_external_actions`.
@@ -79,14 +80,14 @@ Different Providers use that field for role-play replies or control statements s
 - `reasoning` chain -> blocked with no action record.
 - General/provider error result -> blocked without hiding a previous persisted assistant message.
 - Internal tool status chain -> blocked with no action record.
-- QQ sender exception -> failed explicit action record followed by terminal `None`.
+- QQ sender exception -> failed explicit action record plus structured error.
 - Action fact encoding failure after a successful send -> `action_succeeded` plus safe encoding
-  detail followed by terminal `None`.
+  detail in a structured result.
 - Action fact write failure after a successful send -> `action_succeeded` plus safe persistence
-  detail followed by terminal `None`.
+  detail in a structured result.
 - Invalid snapshot target before a gateway attempt -> structured JSON error; the model may
   choose a valid target in a later step.
-- Stale run before gateway admission -> terminal failed action with `stale_run`; zero QQ calls.
+- Stale run before gateway admission -> failed action with `stale_run`; zero QQ calls.
 - Run cleared after gateway admission -> completed QQ side effect plus
   `fact_persist_failed:RuntimeError`; stale terminal state writes are ignored.
 - `stay_silent` outside an autonomous run ->
@@ -110,10 +111,10 @@ Different Providers use that field for role-play replies or control statements s
 - Tool boundary test asserts only `B` reaches the original sender for content `A` plus tool `B`.
 - Isolation tests assert reasoning and general results create zero sends.
 - History test asserts a suppressed pure assistant message is marked `_no_save`.
-- Core-executor test asserts a valid external handler produces `[None]`, the AstrBot terminal
-  signal, while read-only handlers still return structured JSON.
-- Runner integration asserts a terminal action produces one Provider call, one QQ gateway call,
-  one `agent_action`, and no follow-up Provider request.
+- Core-executor test asserts a valid external handler produces a structured result while
+  `stay_silent` produces AstrBot's terminal `[None]` signal.
+- Runner integration asserts an action produces a QQ gateway call and `agent_action`, then a
+  follow-up Provider call can select `stay_silent`.
 - Batch tests assert later actions update the same run to the final succeeded/failed/partial
   classification and keep safe fact diagnostics.
 - Silence-tool tests assert an empty object schema, marker-before-callback ordering, `[None]`,
@@ -213,7 +214,7 @@ allow the Agent to poke a QQ identity already visible in its frozen snapshot.
 - `extract_group_event(event, *, max_text_chars=4000) -> dict[str, Any]`
 - `ToolRuntime._user_in_snapshot(flow_id, user_id, snapshot_seq) -> bool`
 - `QQActionGateway.poke_user(event, *, user_id: str) -> dict[str, Any]`
-- Model tool: `poke_user(user_id: str) -> None | str`
+- Model tool: `poke_user(user_id: str) -> str`
 
 ### 3. Contracts
 
@@ -224,14 +225,14 @@ allow the Agent to poke a QQ identity already visible in its frozen snapshot.
   or a `poke.target_id`.
 - The gateway sends `MessageChain([Comp.Poke(id=user_id)])` through `tool_send()` and records
   `poke_user` as the external action name.
-- The action returns AstrBot's terminal `None` after the gateway attempt.
+- The action returns a structured result after the gateway attempt.
 
 ### 4. Validation & Error Matrix
 
 - Empty `user_id` -> `user_not_found_in_snapshot`; no gateway call.
 - User appears only after `snapshot_seq` -> `user_not_found_in_snapshot`; no gateway call.
 - User appears in the frozen snapshot -> send one native Poke component.
-- QQ sender exception -> failed `poke_user` action followed by terminal `None`.
+- QQ sender exception -> failed `poke_user` action plus structured error.
 
 ### 5. Good/Base/Bad Cases
 

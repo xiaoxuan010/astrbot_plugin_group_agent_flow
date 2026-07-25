@@ -134,8 +134,8 @@ class ToolRuntime:
         event: Any,
         action_name: str,
         operation: Callable[[], Awaitable[dict[str, Any]]],
-    ) -> None:
-        """执行一次外部动作，并返回 AstrBot 的 Agent Loop 终止信号。"""
+    ) -> str:
+        """执行一次外部动作，并返回供下一次规划使用的紧凑结果。"""
         run_id, flow_id, _, generation = self._run_metadata(event)
         if self.action_admission_callback is not None:
             admitted = await self.action_admission_callback(
@@ -150,9 +150,13 @@ class ToolRuntime:
                     success=False,
                     detail="stale_run",
                 )
-                if self.terminal_callback is not None:
-                    await self.terminal_callback(event)
-                return None
+                return _json(
+                    {
+                        "success": False,
+                        "action": action_name,
+                        "error": "stale_run",
+                    }
+                )
         try:
             action_result = await operation()
         except Exception as exc:
@@ -161,6 +165,13 @@ class ToolRuntime:
                 action_name=action_name,
                 success=False,
                 detail=str(exc),
+            )
+            return _json(
+                {
+                    "success": False,
+                    "action": action_name,
+                    "error": type(exc).__name__,
+                }
             )
         else:
             actions = event.get_extra(EXTERNAL_ACTIONS_EXTRA, [])
@@ -204,9 +215,10 @@ class ToolRuntime:
                 success=True,
                 detail=detail,
             )
-        if self.terminal_callback is not None:
-            await self.terminal_callback(event)
-        return None
+            result: dict[str, Any] = {"success": True, "action": action_name}
+            if detail:
+                result["fact_error"] = detail
+            return _json(result)
 
     def build_tool_set(self) -> ToolSet:
         """为每次请求创建独立工具集，避免共享可变工具对象。"""

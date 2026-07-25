@@ -20,8 +20,8 @@
 - Replace AstrBot conversation contexts with the plugin observation window and reset
   conversation token usage before Provider request preparation.
 - Preserve structured message metadata in storage even when a renderer projects it to text.
-- Persist each successful external action as a typed, non-targetable fact before committing the
-  terminal cursor. Extend an existing pending snapshot with the action seq without creating a
+- Persist each successful external action as a typed, non-targetable fact before the run's final
+  cursor commit. Extend an existing pending snapshot with the action seq without creating a
   second scheduling path.
 - Build stable observation blocks from both group messages and agent actions in JSONL order.
   Use Core `EstimateTokenCounter`, the configured hard token budget, and bulk oldest-block
@@ -67,16 +67,16 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
 - Overflow removes multiple oldest blocks toward the configured retention ratio. A latest-only
   block remains within the hard token budget and preserves a recovery marker for oversized
   single records.
-- Multiple external actions from one Provider tool batch may execute in declared order; the
-  batch ends without a follow-up Provider request. Each callback recomputes the same run outcome
-  from the full accumulated action list. No tool call ends as a persisted no-action outcome.
+- Multiple external actions from one Provider tool batch may execute in declared order, and an
+  external action result may drive a later Provider call. The finalizer computes the run outcome
+  from the complete accumulated action list. No tool call ends as a persisted no-action outcome.
 - Unknown or future message IDs cannot be read or targeted.
 - Synthetic `agent-action:*` IDs remain readable through history tools and are rejected by
   reply/react target validation.
 - Ordinary provider content, reasoning, Provider errors, and internal tool status cannot reach
   QQ; an explicit action tool reaches QQ exactly once.
-- External action handlers return AstrBot's `None` terminal signal after persisting the run
-  outcome and cursor, preventing a follow-up Provider request.
+- External action handlers return compact structured results after fact persistence. Only
+  `stay_silent` returns AstrBot's `None` terminal signal and advances the cursor.
 - A delayed snapshot already covered by cursor records `empty_snapshot_skipped`, assigns no
   tools, and makes no Provider request.
 - `/gaf_clear` invalidates pending and active runs. Old runs perform no later state writes;

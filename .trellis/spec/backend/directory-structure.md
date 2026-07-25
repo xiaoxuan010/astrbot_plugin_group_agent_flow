@@ -12,7 +12,7 @@
   `context_renderers.py`.
 - `context_renderers.py` contains interchangeable LLM context projections. A renderer
   returns OpenAI-style message dictionaries and does not read storage or config.
-- `agent_tools.py` defines the model-visible tool schemas and terminal-action policy.
+- `agent_tools.py` defines the model-visible tool schemas and explicit termination policy.
   `qq_gateway.py` contains QQ/AstrBot side effects.
 - `response_policy.py` owns the controlled platform boundary: it blocks ordinary model content,
   reasoning, Provider errors, and internal tool status while preserving the original sender
@@ -34,7 +34,7 @@ use the existing relative-import fallback pattern from `agent_tools.py` and `obs
 - Add a new persisted message field in `event_codec.py`, then update renderers or tools only
   when they consume it.
 - Add a new external QQ action through `QQActionGateway`, expose it through `ToolRuntime`, and
-  return the same terminal `None` contract after recording the gateway attempt.
+  return the same compact structured result contract after recording the gateway attempt.
 - Add configuration in both `_conf_schema.json` and `CONFIG_PATHS`/`CONFIG_DEFAULTS` in
   `main.py`.
 

@@ -51,7 +51,7 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 拒绝；清理先于动作准入时，QQ 网关也不会执行该动作。无文本且无组件的适配器传输事件可以保留
 用于诊断，进入模型前会被过滤。
 
-终止型动作返回 `None` 后，AstrBot Agent history 可能跳过该轮 tool call/result；插件 JSONL
+`stay_silent` 返回 `None` 后，AstrBot Agent history 可能跳过该轮 tool call/result；插件 JSONL
 承担完整群聊事实来源。入站事件保存为 `record_kind=group_message`，成功执行的
 `send_message`、`reply_message`、`react_message`、`poke_user` 保存为
 `record_kind=agent_action`。下一轮 renderer 会明确投影 `actor=bot`、动作、目标和成功状态。

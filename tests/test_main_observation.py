@@ -195,8 +195,7 @@ async def test_stay_silent_persists_outcome_and_advances_cursor(tmp_path):
             PENDING_CURSOR_EXTRA: {
                 "conversation_id": "conv",
                 "target_seq": 1,
-                "renderer": "plain_lines",
-                "window_blocks": ((1, 1),),
+                "history_cursor": 1,
             },
         }
     )
@@ -205,9 +204,7 @@ async def test_stay_silent_persists_outcome_and_advances_cursor(tmp_path):
 
     assert store.get_run_outcome(snapshot.run_id)["outcome"] == "silence_selected"
     assert store.get_cursor(flow_id, "conv") == 1
-    assert store.get_observation_window(flow_id, "conv")["blocks"] == [
-        {"start_seq": 1, "end_seq": 1}
-    ]
+    assert store.get_history_cursor(flow_id, "conv") == 1
 
 
 @pytest.mark.asyncio
@@ -361,8 +358,7 @@ async def test_clear_invalidates_old_run_state_and_action_writes(tmp_path):
             PENDING_CURSOR_EXTRA: {
                 "conversation_id": "conv",
                 "target_seq": 1,
-                "renderer": "plain_lines",
-                "window_blocks": ((1, 1),),
+                "history_cursor": 1,
             },
         }
     )
@@ -393,7 +389,38 @@ async def test_clear_invalidates_old_run_state_and_action_writes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inject_snapshot_stops_before_provider_when_cursor_covers_snapshot(
+async def test_clear_also_resets_current_core_conversation_history(tmp_path):
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = GroupFlowStore(tmp_path)
+    plugin.config = {}
+    plugin._locks = {}
+    plugin.coordinator = GroupRunCoordinator(
+        debounce_seconds=0, direct_delay_seconds=0, min_cycle_interval_seconds=0
+    )
+    updates = []
+
+    class Manager:
+        async def get_curr_conversation_id(self, _origin):
+            return "conv"
+
+        async def update_conversation(self, origin, cid, *, history, token_usage):
+            updates.append((origin, cid, history, token_usage))
+
+    plugin.context = SimpleNamespace(conversation_manager=Manager())
+    event = FakeEvent({})
+    event.get_message_type = lambda: main_module.MessageType.GROUP_MESSAGE
+    event.get_platform_id = lambda: "qq"
+    event.get_group_id = lambda: "1"
+    event.plain_result = lambda content: content
+
+    results = [result async for result in plugin.group_agent_clear(event)]
+
+    assert updates == [("qq:GroupMessage:1", "conv", [], 0)]
+    assert results == ["Group Agent Flow data cleared for this group."]
+
+
+@pytest.mark.asyncio
+async def test_inject_snapshot_bootstraps_when_only_legacy_cursor_covers_snapshot(
     tmp_path,
 ):
     flow_id = "qq:group:1"
@@ -438,11 +465,12 @@ async def test_inject_snapshot_stops_before_provider_when_cursor_covers_snapshot
 
     await plugin.inject_snapshot(event, request)
 
-    assert event.stopped is True
-    assert request.contexts == []
-    assert request.func_tool is None
+    assert event.stopped is False
+    assert len(request.contexts) == 1
+    assert "already consumed" in request.contexts[0]["content"]
+    assert request.func_tool == "tools"
     assert request.conversation.token_usage == 0
-    assert store.get_run_outcome(snapshot.run_id)["outcome"] == "empty_snapshot_skipped"
+    assert store.get_run_outcome(snapshot.run_id) is None
 
 
 @pytest.mark.asyncio
@@ -501,14 +529,86 @@ async def test_inject_snapshot_adds_completed_agent_action_to_provider_context(t
     assert request.conversation.token_usage == 0
     assert request.func_tool == "tools"
     assert store.get_cursor(flow_id, "conv") == 0
-    assert store.get_observation_window(flow_id, "conv") is None
+    assert store.get_history_cursor(flow_id, "conv") is None
 
     await plugin._persist_observation_state(event, had_direct_output=False)
 
     assert store.get_cursor(flow_id, "conv") == 1
-    assert store.get_observation_window(flow_id, "conv")["blocks"] == [
-        {"start_seq": 1, "end_seq": 1}
+    assert store.get_history_cursor(flow_id, "conv") == 1
+
+
+@pytest.mark.asyncio
+async def test_inject_snapshot_uses_the_current_renderer_without_replacing_core_history(tmp_path):
+    flow_id = "qq:group:1"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        flow_id,
+        {
+            "message_id": "m1",
+            "group_id": "1",
+            "sender_id": "2",
+            "sender_name": "Alice",
+            "timestamp": 1710000000,
+            "text": "earlier message",
+        },
+    )
+    store.get_or_assign_renderer(flow_id, "conv", "legacy_delta")
+    store.commit_observation(
+        flow_id,
+        "conv",
+        1,
+        unified_msg_origin="qq:GroupMessage:1",
+        history_cursor=1,
+    )
+    store.append_record(
+        flow_id,
+        {
+            "message_id": "m2",
+            "group_id": "1",
+            "sender_id": "3",
+            "sender_name": "Bob",
+            "timestamp": 1710000001,
+            "text": "new message",
+        },
+    )
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.config = {"context": {"renderer": "native_messages"}}
+    plugin._locks = {}
+    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    snapshot = _activate_run(plugin, flow_id, 2)
+    event = FakeEvent(
+        {
+            AUTONOMOUS_EXTRA: True,
+            FLOW_ID_EXTRA: flow_id,
+            RUN_ID_EXTRA: snapshot.run_id,
+            RUN_GENERATION_EXTRA: snapshot.generation,
+            SNAPSHOT_SEQ_EXTRA: 2,
+        }
+    )
+    request = SimpleNamespace(
+        conversation=SimpleNamespace(cid="conv", token_usage=999),
+        contexts=[
+            {"role": "assistant", "content": "previous assistant output"},
+            {"role": "tool", "content": "previous tool result"},
+        ],
+        func_tool=None,
+    )
+
+    await plugin.inject_snapshot(event, request)
+
+    assert request.contexts[:2] == [
+        {"role": "assistant", "content": "previous assistant output"},
+        {"role": "tool", "content": "previous tool result"},
     ]
+    assert request.contexts[2]["role"] == "user"
+    assert "msg=m2" in request.contexts[2]["content"]
+    assert "new message" in request.contexts[2]["content"]
+    assert "group_messages_delta" not in request.contexts[2]["content"]
+    assert request.conversation.token_usage == (
+        999 + event.get_extra(PENDING_CURSOR_EXTRA)["estimated_tokens"]
+    )
+    assert store.get_or_assign_renderer(flow_id, "conv", "native_messages") == "native_messages"
 
 
 @pytest.mark.asyncio

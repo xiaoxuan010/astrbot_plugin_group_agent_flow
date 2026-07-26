@@ -6,8 +6,8 @@ The plugin has no ORM or application database. `GroupFlowStore` in `store.py` ow
 of local persistence under `data/plugin_data/astrbot_plugin_group_agent_flow/`:
 
 - Per-flow JSONL logs contain normalized group events with monotonic `seq` values.
-- `state.json` contains conversation cursors, renderer assignments, cursor metadata,
-  observation block windows, and per-run outcomes.
+- `state.json` contains conversation cursors, renderer assignments, history cursors,
+  cursor metadata, and per-run outcomes.
 
 Flow filenames are SHA-256-derived so platform and group identifiers never become paths.
 Use `GroupFlowStore` methods for every read or write; callers should not know log filenames.
@@ -20,8 +20,9 @@ Use `GroupFlowStore` methods for every read or write; callers should not know lo
 - Keep sequence values increasing even when retention trims old records.
 - Keep each conversation cursor monotonically increasing. A delayed or stale run may finish
   after a newer run and must never move the cursor backwards.
-- Persist a conversation's cursor and observation block window only after a successful run.
-  Both writes occur under the per-flow lock after validating the run generation.
+- Persist a conversation's cursor and history cursor only after a successful run. Both values
+  are committed through one state-file replacement under the per-flow lock after validating
+  the run generation.
 - Bound user-facing search limits to 1-100 records.
 - Apply `max_seq` before the result limit so an observation cannot see messages newer than
   its frozen snapshot.
@@ -44,6 +45,131 @@ Avoid ad hoc file writes, path names derived directly from QQ IDs, and cursor ad
 beyond the run's `snapshot_seq`.
 
 ## Scenario: An external action enters the group fact stream
+
+## Scenario: Core multi-role history is paired with JSONL deltas
+
+### 1. Scope / Trigger
+
+An autonomous group run needs prior `assistant` tool calls, `tool` results, and reasoning without rendering an already-completed `agent_action` as a second user message.
+
+### 2. Signatures
+
+- `GroupFlowStore.get_history_cursor(flow_id, conversation_id) -> int | None`
+- `GroupFlowStore.commit_observation(..., history_cursor: int) -> None`
+- `prepare_observation(..., history_cursor: int | None = None) -> PreparedObservation`
+- `suppress_direct_output(response, *, run_context=None) -> bool`
+
+### 3. Contracts
+
+- AstrBot `Conversation.history` owns raw `user`/`assistant`/`tool` messages and assistant `ThinkPart` reasoning.
+- `state.json.history_cursors` records the greatest JSONL sequence already represented in Core history.
+- Missing history cursor starts a clean bootstrap with `req.contexts=[]` and renders a
+  token-bounded recent suffix selected from `(0, snapshot_seq]`; later runs retain Core
+  contexts and append only records in `(history_cursor, snapshot_seq]`.
+- Missing history cursor also resets `Conversation.token_usage=0`. Later runs retain the
+  persisted Core token baseline and add `PreparedObservation.estimated_tokens` before the first
+  Core context-limit check.
+- `context.renderer` is read for every request. Its new value projects the next JSONL suffix immediately; existing Core multi-role history retains the original provider serialization.
+- Incremental renderer input excludes `record_kind="agent_action"`; JSONL keeps it for audit, tools, and scheduling.
+- A suppressed plain assistant is removed from Core history. Tool-call assistants and matching tool results remain in their original sequence.
+
+### 4. Validation & Error Matrix
+
+- Invalid/missing history cursor -> bootstrap; legacy Core history is not mixed in.
+- Existing history cursor plus missing Provider usage -> retain the best available token
+  baseline and add the next observation estimate; never replace it with zero.
+- Stale run -> cursor and history cursor remain unchanged.
+- `/gaf_clear` -> clear current Core conversation history before deleting plugin flow state.
+- Provider lacking a reasoning representation -> Core adapter performs its native safe conversion; plugin never injects `think` blocks directly.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `assistant(tool_calls)`, matching `tool(tool_call_id)`, then only new JSONL user delta reach the Provider.
+- Base: a plain assistant response produces `direct_output_suppressed` and contributes no Core history entry.
+- Bad: render the same `agent_action` as user after its tool result, causing the model to repeat the QQ reply.
+
+### 6. Tests Required
+
+- Store test commits and clears `history_cursor` with the ordinary observation cursor.
+- Request test retains Core contexts only after bootstrap and excludes incremental action facts.
+- Request test asserts bootstrap token usage is zero and incremental token usage equals the
+  persisted baseline plus `PreparedObservation.estimated_tokens`.
+- Response-policy test removes the terminal plain assistant while retaining prior tool-call and tool-result messages.
+- Core-compatible test preserves `ThinkPart(think, encrypted)` through reload and request serialization.
+
+### 7. Wrong vs Correct
+
+Wrong: copy raw assistant/tool messages into JSONL and render every fact as `role=user`.
+
+Correct: keep Core history as the raw multi-role source, keep JSONL as the ordered group-fact source, and join them only at the committed sequence waterline.
+
+## Scenario: Core persists a terminal tool chain without a final assistant response
+
+### 1. Scope / Trigger
+
+AstrBot Core's agent runner finishes through a terminal tool such as `stay_silent`. The tool
+returns `None`, so `final_llm_resp` is also `None`, while `ProviderRequest.tool_calls_result`
+contains the assistant tool call and matching tool result that must survive into the next
+autonomous observation cycle.
+
+### 2. Signatures
+
+- `AgentSubStage._save_to_history(event, req, llm_response, all_messages, user_aborted)`
+- `ProviderRequest.tool_calls_result: list[ToolCallsResult]`
+- `ConversationManager.update_conversation(..., history, token_usage=<latest baseline>)`
+
+### 3. Contracts
+
+- When `llm_response is None` and `req.tool_calls_result` is non-empty, Core saves
+  `all_messages` after checkpoint serialization even when `llm_checkpoint_id` is absent.
+- The saved sequence retains the current user observation, assistant tool-call message, and
+  matching tool-result message with the same `tool_call_id`.
+- The same update persists `req.conversation.token_usage`, which the runner refreshes from the
+  latest Provider `LLMResponse.usage.total` before tool execution.
+- A valid `llm_checkpoint_id` continues to append `CHECKPOINT_FINISHED_ABNORMAL` for provider
+  failures and other abnormal termination paths.
+- `user_aborted`, `_no_save`, conversation absence, and conversation mismatch continue to
+  suppress history writes.
+- The plugin advances `history_cursor` only after the successful Core-backed run completes, so
+  the cursor never claims that JSONL events exist in missing Core history.
+
+### 4. Validation & Error Matrix
+
+- `llm_response=None`, non-empty `tool_calls_result`, no checkpoint -> save the complete message
+  chain with the latest `req.conversation.token_usage`.
+- `llm_response=None`, empty `tool_calls_result`, no checkpoint -> skip the history write.
+- `llm_response=None`, valid checkpoint -> save the complete message chain plus abnormal
+  checkpoint marker with `token_usage=None`.
+- `user_aborted=True` -> skip the history write regardless of tool results.
+- Assistant `llm_response` -> use the normal assistant-response persistence path and preserve
+  token usage.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `stay_silent` ends the loop and the next cycle receives the prior user observation,
+  assistant tool call, and successful tool result.
+- Base: an empty response with no tool execution and no checkpoint leaves conversation history
+  unchanged.
+- Bad: advance the plugin's JSONL history cursor after a successful terminal tool while Core
+  drops the tool chain, causing the next request to jump across unrepresented group events.
+
+### 6. Tests Required
+
+- Core regression test constructs real `ToolCall`, assistant tool-call, and tool-result message
+  objects, calls `_save_to_history()` with `llm_response=None` and no checkpoint, and asserts the
+  exact history and token baseline passed to `update_conversation()`.
+- Core safety test calls the same path without `tool_calls_result` and asserts that
+  `update_conversation()` is not awaited.
+- Related runner and checkpoint suites must preserve existing abnormal-checkpoint, abort,
+  no-save, and normal assistant behavior.
+
+### 7. Wrong vs Correct
+
+Wrong: treat every `llm_response=None` outcome without a checkpoint as empty and return before
+persisting the already-executed tool chain.
+
+Correct: use non-empty `ProviderRequest.tool_calls_result` as evidence of a completed terminal
+tool chain and persist `all_messages` before returning.
 
 ### 1. Scope / Trigger
 
@@ -74,8 +200,9 @@ later Provider step ends the run.
   A later inbound event naturally covers an action written while no pending snapshot exists.
 - Persist and enqueue an inbound group message while holding the same per-flow lock. This closes
   the interval where an action could be appended after the message but before its pending state.
-- `agent_action` and `group_message` records enter observation blocks together in increasing
-  `seq` order. Earlier actions remain visible only while their blocks remain active.
+- Bootstrap selection admits `agent_action` and `group_message` records together in increasing
+  `seq` order. Incremental selection excludes `agent_action` because Core history already owns
+  the completed assistant/tool chain.
 - A repeated outcome write may update only the same `(run_id, flow_id, snapshot_seq)`. It keeps
   the initial `recorded_at` and recomputes outcome/detail from the complete action batch.
 
@@ -91,7 +218,7 @@ later Provider step ends the run.
 - Existing run ID with a different flow or snapshot -> outcome update rejected.
 - Run invalidated by `/gaf_clear` before gateway admission -> zero gateway calls and zero writes.
 - Gateway admitted before `/gaf_clear` -> the side effect may complete; stale fact, outcome,
-  cursor, and window writes are rejected.
+  cursor, and history-cursor writes are rejected.
 
 ### 5. Good/Base/Bad Cases
 
@@ -171,17 +298,17 @@ Wrong: parse `[引用消息(...)]` or `[At:...]` from the flattened AstrBot outl
 
 Correct: persist the structured component fields at ingestion, then render them directly in XML.
 
-## Scenario: A token-bounded observation window is committed
+## Scenario: A token-bounded observation delta is committed
 
 ### 1. Scope / Trigger
 
-A frozen snapshot contains at least one new model-visible record. The Provider receives a
-recent JSONL suffix assembled from stable observation blocks.
+A frozen snapshot contains at least one model-visible record. The Provider receives one
+token-bounded JSONL suffix selected from the committed Core-history waterline.
 
 ### 2. Signatures
 
-- `prepare_observation(..., max_context_tokens, rotation_retention_ratio) -> PreparedObservation`
-- `GroupFlowStore.commit_observation(flow_id, conversation_id, seq, *, unified_msg_origin, renderer_name, blocks) -> None`
+- `prepare_observation(..., max_context_tokens, history_cursor: int | None = None) -> PreparedObservation`
+- `GroupFlowStore.commit_observation(flow_id, conversation_id, seq, *, unified_msg_origin, history_cursor: int) -> None`
 - `GroupRunCoordinator.clear_flow(flow_id) -> int`
 - `GroupRunCoordinator.is_run_current(run_id, *, flow_id, generation) -> bool`
 
@@ -190,49 +317,53 @@ recent JSONL suffix assembled from stable observation blocks.
 - `context.max_context_tokens` is the single hard observation budget and defaults to 8192.
 - Count renderer output through AstrBot Core `EstimateTokenCounter` after validating contexts
   as Core `Message` values.
-- Each successful observation appends one latest block and persists its `start_seq` / `end_seq`
-  with the renderer assignment.
-- Rebuild historical blocks from JSONL and persisted boundaries. Missing retained boundaries
-  invalidate the affected prefix and trigger a recent-history bootstrap.
-- On overflow, remove oldest complete blocks until usage reaches
-  `max_context_tokens * rotation_retention_ratio`, or only the latest block remains.
-- A latest block above the hard limit loses oldest records first. A single oversized record
+- A missing `history_cursor` selects records from `(0, snapshot_seq]`, drops the oldest records
+  until the rendered suffix fits, replaces AstrBot conversation contexts, and resets
+  conversation `token_usage`.
+- An existing `history_cursor` selects records from `(history_cursor, snapshot_seq]`, excludes
+  `record_kind="agent_action"`, preserves Core contexts, and adds the selected suffix estimate
+  to the persisted token baseline.
+- A selected suffix above the hard limit loses oldest records first. A single oversized record
   retains identity metadata, a text tail, and a visible `get_message` recovery marker.
-- Replace AstrBot conversation contexts with the selected blocks and reset conversation
-  `token_usage` before Core prepares the Provider request.
-- `/gaf_clear` removes logs, cursors, renderer assignments, windows, run outcomes, and the
+- A successful run commits the ordinary cursor and `history_cursor=snapshot_seq` together.
+  The state schema contains no `observation_windows` or renderer-specific block boundaries.
+- `/gaf_clear` removes logs, cursors, renderer assignments, history cursors, run outcomes, and the
   coordinator flow state inside one per-flow critical section.
 
 ### 4. Validation & Error Matrix
 
-- Malformed, overlapping, or non-increasing block boundaries -> window rejected.
-- Persisted block cannot be reconstructed after JSONL retention -> invalid prefix discarded;
-  readable recent suffix remains eligible.
-- Latest record exceeds budget -> deterministic metadata-preserving tail truncation.
+- Missing history cursor plus stale ordinary cursor or legacy window data -> ignore both and
+  bootstrap from cursor `0`.
+- Existing history cursor greater than or equal to `snapshot_seq` -> empty observation; Provider
+  request does not proceed.
+- Selected record exceeds budget -> deterministic metadata-preserving tail truncation.
 - Minimum metadata and recovery marker exceed budget -> `ValueError` mentioning
   `max_context_tokens`; Provider request does not proceed.
-- Old generation attempts outcome, cursor, window, or fact write -> write ignored or rejected.
+- Old generation attempts outcome, cursor, history-cursor, or fact write -> write ignored or
+  rejected.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: a 7800-token history plus a 900-token latest block rotates oldest complete blocks
-  toward 4096 at the default settings, then persists the remaining stable prefix.
-- Base: an under-budget run reuses every previous context byte and appends one latest block.
-- Bad: remove one oldest message every cycle or append the plugin window to AstrBot's old
-  assistant/tool history, causing repeated prefix-cache invalidation and duplicate context.
+- Good: an existing history cursor at seq 20 and snapshot seq 24 renders only group messages
+  from seq 21-24, while Core retains its prior assistant/tool chain.
+- Base: a missing history cursor renders the newest suffix within 8192 tokens from all readable
+  records through the frozen snapshot.
+- Bad: restore legacy block boundaries or render incremental `agent_action` facts after Core
+  already persisted their assistant/tool results.
 
 ### 6. Tests Required
 
-- Store reload, malformed window, retention loss, and flow clear coverage.
-- Bootstrap, stable-prefix append, multi-block rotation, retention-ratio boundaries, latest
-  block trimming, oversized-record recovery, and exact Core counter coverage.
-- Request replacement, cursor/window commit, failed-run retry, and stale-generation rejection.
+- Store atomic cursor/history-cursor commit, fresh-state schema, reload, and flow clear coverage.
+- Bootstrap from cursor `0`, incremental selection, legacy-window input ignored, oldest-record
+  trimming, oversized-record recovery, and exact Core counter coverage.
+- Request bootstrap/incremental token accounting, cursor/history-cursor commit, failed-run retry,
+  and stale-generation rejection.
 
 ### 7. Wrong vs Correct
 
-Wrong: cap each run by a message count, replay cursor-before actions separately, and let
-AstrBot conversation history determine the remaining visible messages.
+Wrong: restore persisted block windows, apply a second retention ratio, replay incremental
+actions separately, or clear a trusted Core token baseline while retaining its contexts.
 
-Correct: rebuild a token-bounded active block suffix from JSONL, replace request contexts,
-commit cursor and block boundaries in one state-file replacement, and query older facts through
-snapshot-bounded tools.
+Correct: bootstrap a token-bounded recent suffix from cursor `0`, continue from the committed
+history cursor with one JSONL delta and an adjusted Core token baseline, commit both cursors in
+one state-file replacement, and query older facts through snapshot-bounded tools.

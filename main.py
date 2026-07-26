@@ -76,7 +76,6 @@ CONFIG_PATHS = {
     "min_cycle_interval_seconds": ("scheduling", "min_cycle_interval_seconds"),
     "context_renderer": ("context", "renderer"),
     "max_context_tokens": ("context", "max_context_tokens"),
-    "rotation_retention_ratio": ("context", "rotation_retention_ratio"),
     "max_log_records": ("context", "max_log_records"),
     "max_text_chars": ("context", "max_text_chars"),
     "record_self_messages": ("context", "record_self_messages"),
@@ -93,7 +92,6 @@ CONFIG_DEFAULTS = {
     "min_cycle_interval_seconds": 10.0,
     "context_renderer": "legacy_delta",
     "max_context_tokens": 8192,
-    "rotation_retention_ratio": 0.5,
     "max_log_records": 10000,
     "max_text_chars": 4000,
     "record_self_messages": False,
@@ -348,7 +346,7 @@ class GroupAgentFlowPlugin(Star):
 
     @filter.on_llm_request(priority=maxsize - 20)
     async def inject_snapshot(self, event: AstrMessageEvent, req: ProviderRequest):
-        """用持久化 observation 窗口替换原生会话上下文。"""
+        """注入持久化 observation 增量并续算上下文 token 基线。"""
         if not event.get_extra(AUTONOMOUS_EXTRA, False) or not req.conversation:
             return
         flow_id = str(event.get_extra(FLOW_ID_EXTRA, "") or "")
@@ -356,8 +354,9 @@ class GroupAgentFlowPlugin(Star):
         run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
         generation = int(event.get_extra(RUN_GENERATION_EXTRA, -1) or 0)
         default_renderer = str(self._cfg("context_renderer", "legacy_delta"))
-        req.contexts = []
-        req.conversation.token_usage = 0
+        history_cursor = self.store.get_history_cursor(flow_id, req.conversation.cid)
+        if history_cursor is None:
+            req.contexts = []
         async with self._lock_for(flow_id):
             if not self.coordinator.is_run_current(
                 run_id,
@@ -366,7 +365,7 @@ class GroupAgentFlowPlugin(Star):
             ):
                 event.stop_event()
                 return
-            # 每个会话固定使用一个 renderer，避免同一实验混入不同上下文格式。
+            # 当前配置在下一轮请求生效；已写入 Core 的多角色历史保持原始形态。
             renderer_name = self.store.get_or_assign_renderer(
                 flow_id,
                 req.conversation.cid,
@@ -375,23 +374,25 @@ class GroupAgentFlowPlugin(Star):
             prepared = prepare_observation(
                 self.store,
                 flow_id=flow_id,
-                conversation_id=req.conversation.cid,
                 snapshot_seq=snapshot_seq,
                 renderer_name=renderer_name,
                 max_context_tokens=int(self._cfg("max_context_tokens", 8192) or 0),
-                rotation_retention_ratio=float(
-                    self._cfg("rotation_retention_ratio", 0.5) or 0.5
-                ),
+                history_cursor=history_cursor,
             )
+            if history_cursor is None:
+                req.conversation.token_usage = 0
+            else:
+                req.conversation.token_usage = (
+                    req.conversation.token_usage or 0
+                ) + prepared.estimated_tokens
             pending = {
                 "flow_id": flow_id,
                 "conversation_id": req.conversation.cid,
                 "target_seq": prepared.target_cursor,
-                "renderer": prepared.renderer_name,
                 "count": len(prepared.source_seqs),
                 "skipped": prepared.skipped_count,
                 "estimated_tokens": prepared.estimated_tokens,
-                "window_blocks": prepared.window_blocks,
+                "history_cursor": prepared.target_cursor,
             }
             event.set_extra(PENDING_CURSOR_EXTRA, pending)
             if not prepared.source_seqs:
@@ -408,11 +409,7 @@ class GroupAgentFlowPlugin(Star):
                     req.conversation.cid,
                     prepared.target_cursor,
                     unified_msg_origin=event.unified_msg_origin,
-                    renderer_name=prepared.renderer_name,
-                    blocks=[
-                        {"start_seq": start_seq, "end_seq": end_seq}
-                        for start_seq, end_seq in prepared.window_blocks
-                    ],
+                    history_cursor=prepared.target_cursor,
                 )
         if not prepared.source_seqs:
             if bool(self._cfg("debug_log", False)):
@@ -423,7 +420,7 @@ class GroupAgentFlowPlugin(Star):
                 )
             event.stop_event()
             return
-        req.contexts = list(prepared.contexts)
+        req.contexts = [*req.contexts, *prepared.contexts]
         req.func_tool = self.tool_runtime.build_tool_set()
         if bool(self._cfg("debug_log", False)):
             logger.debug(
@@ -504,11 +501,7 @@ class GroupAgentFlowPlugin(Star):
                     str(pending["conversation_id"]),
                     int(pending.get("target_seq") or snapshot_seq),
                     unified_msg_origin=event.unified_msg_origin,
-                    renderer_name=str(pending.get("renderer") or ""),
-                    blocks=[
-                        {"start_seq": int(start), "end_seq": int(end)}
-                        for start, end in pending.get("window_blocks", ())
-                    ],
+                    history_cursor=int(pending.get("history_cursor") or snapshot_seq),
                 )
 
     @filter.on_agent_begin(priority=maxsize - 20)
@@ -572,6 +565,18 @@ class GroupAgentFlowPlugin(Star):
             return
         flow_id = f"{event.get_platform_id()}:group:{event.get_group_id()}"
         async with self._lock_for(flow_id):
+            context = getattr(self, "context", None)
+            if context is not None:
+                conversation_id = await context.conversation_manager.get_curr_conversation_id(
+                    event.unified_msg_origin
+                )
+                if conversation_id:
+                    await context.conversation_manager.update_conversation(
+                        event.unified_msg_origin,
+                        conversation_id,
+                        history=[],
+                        token_usage=0,
+                    )
             self.coordinator.clear_flow(flow_id)
             self.store.clear_flow(flow_id)
         yield event.plain_result("Group Agent Flow data cleared for this group.")

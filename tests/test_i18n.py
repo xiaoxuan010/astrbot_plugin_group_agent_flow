@@ -58,13 +58,7 @@ def test_context_window_uses_token_budget_and_cache_retention_settings():
     assert "max_messages_per_cycle" not in items
     assert items["max_context_tokens"]["type"] == "int"
     assert items["max_context_tokens"]["default"] == 8192
-    assert items["rotation_retention_ratio"]["type"] == "float"
-    assert items["rotation_retention_ratio"]["default"] == 0.5
-    assert items["rotation_retention_ratio"]["slider"] == {
-        "min": 0.1,
-        "max": 0.9,
-        "step": 0.05,
-    }
+    assert "rotation_retention_ratio" not in items
 
 
 def test_renderer_labels_describe_the_actual_message_structure():

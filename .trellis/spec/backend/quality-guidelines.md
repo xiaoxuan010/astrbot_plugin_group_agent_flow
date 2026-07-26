@@ -8,8 +8,9 @@
   boundary. Only `send_message`, `reply_message`, `react_message`, and `poke_user` may reach QQ. Keep
   ordinary `LLM_RESULT` content, reasoning, Provider errors, and internal tool status behind
   the send guard.
-- Keep renderer behavior deterministic. Renderer selection is assigned once per
-  flow/conversation in `state.json` so experiments do not mix formats mid-conversation.
+- Keep renderer behavior deterministic. Read `context.renderer` for each request and record
+  the renderer used for that cycle; Core multi-role history remains in its original form while
+  only the next JSONL suffix uses the current renderer.
 - Keep renderer labels aligned with request structure: `legacy_delta` is
   `聚合增量块（短线分隔）`, `plain_lines` is `聚合增量块（换行分隔）`, and
   `native_messages` is `逐消息独占 User 块`. Labels may change; option values and defaults
@@ -17,15 +18,18 @@
 - Empty renderer input produces no user message. A stale or contentless snapshot stops in
   `OnLLMRequestEvent` before the Provider receives a request, and cursor updates remain
   monotonic across delayed runs.
-- Replace AstrBot conversation contexts with the plugin observation window and reset
-  conversation token usage before Provider request preparation.
+- On a missing history cursor, replace AstrBot conversation contexts with the plugin
+  token-bounded recent JSONL suffix selected from cursor `0` and reset conversation token
+  usage. On an existing history cursor, preserve Core contexts, render only the waterline
+  delta, and add its estimate to the persisted token baseline before Provider preparation.
 - Preserve structured message metadata in storage even when a renderer projects it to text.
 - Persist each successful external action as a typed, non-targetable fact before the run's final
   cursor commit. Extend an existing pending snapshot with the action seq without creating a
   second scheduling path.
-- Build stable observation blocks from both group messages and agent actions in JSONL order.
-  Use Core `EstimateTokenCounter`, the configured hard token budget, and bulk oldest-block
-  rotation. Keep earlier facts accessible through snapshot-bounded history tools.
+- Build one observation suffix from JSONL in increasing sequence order. Use Core
+  `EstimateTokenCounter` and the configured hard token budget; trim oldest selected records
+  when the suffix exceeds the budget. Keep earlier facts accessible through snapshot-bounded
+  history tools.
 - Validate run generation under the per-flow lock before gateway admission, fact persistence,
   and terminal state writes. Clear persistent and coordinator flow state in the same critical
   section.
@@ -62,11 +66,11 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
   pending upper bound to the action seq; an action with no pending message remains unscheduled.
 - Inbound `append_record()` and coordinator `enqueue()` execute under one per-flow lock, so every
   action ordering is covered by the next valid pending snapshot.
-- Two consecutive observations reuse the same rendered historical block prefix and append the
-  new block at the tail. An empty delta remains empty and does not schedule work from history.
-- Overflow removes multiple oldest blocks toward the configured retention ratio. A latest-only
-  block remains within the hard token budget and preserves a recovery marker for oversized
-  single records.
+- A missing history cursor ignores stale ordinary cursors and legacy window data, then rebuilds
+  from cursor `0`. An existing history cursor renders only `(history_cursor, snapshot_seq]`;
+  an empty delta makes no Provider request.
+- Overflow removes oldest selected records until the rendered suffix fits the hard token budget.
+  A single oversized record retains identity metadata and a visible recovery marker.
 - Multiple external actions from one Provider tool batch may execute in declared order, and an
   external action result may drive a later Provider call. The finalizer computes the run outcome
   from the complete accumulated action list. No tool call ends as a persisted no-action outcome.
@@ -81,7 +85,8 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
   tools, and makes no Provider request.
 - `/gaf_clear` invalidates pending and active runs. Old runs perform no later state writes;
   actions rejected after clear make zero gateway calls.
-- `_conf_schema.json`, defaults, metadata, README, and migration behavior remain aligned.
+- `_conf_schema.json`, runtime defaults/lookups, metadata, README, and state-writing behavior
+  remain aligned.
 - Both plugin locale files parse successfully and pass schema coverage tests after any
   metadata or configuration-schema text change.
 - AstrBot core files and unrelated worktree changes remain untouched.

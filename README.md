@@ -38,14 +38,14 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 - XML 增量块（结构化组件，`xml_delta`）：生成一个 User 块，使用 `<group_messages_delta>` 在外层传递群号和群名，内部以 XML 表达消息、机器人动作、引用、提及、文本和媒体组件。
 
 四个 option value 为兼容已保存配置保持不变。`---` 是人为分隔协议，提供比普通换行更明显的
-记录边界；仓库中尚无模型评测能确定最优格式。renderer 会在某个 conversation 首次运行时固定，
-修改默认值只影响新 conversation，方便对三种格式进行独立对照。
+记录边界；仓库中尚无模型评测能确定最优格式。修改 `context.renderer` 后，同一群聊的下一轮请求
+立即采用新投影格式；已进入 AstrBot Core 会话的 `user`、`assistant`、`tool` 原始历史及 reasoning
+保持原样，增量 JSONL 只投影尚未进入该会话的新记录。
 
-每轮请求会用插件持久化窗口替换 AstrBot conversation contexts，并将 conversation token usage
-重置后交给 Core 重新统计。`max_context_tokens` 默认 8192，使用 AstrBot Core
-`EstimateTokenCounter` 计数。每次观察形成一个独立块；超限时按
-`rotation_retention_ratio` 从最旧完整块批量轮转，默认保留到 50%，减少逐块移动造成的前缀缓存失效。
-最新块单独超限时会移除块内最旧记录；单条记录仍超限时保留元数据、内容尾部和 `get_message`
+首次观察会清空 AstrBot conversation contexts 并建立基线；后续请求保留 Core 多角色历史，附加本轮
+增量投影，并把 observation 估算量追加到已持久化的 conversation token usage 基线。`max_context_tokens` 默认 8192，使用 AstrBot Core
+`EstimateTokenCounter` 计数。缺少 `history_cursor` 时从 cursor `0` 重建最近 JSONL 后缀；
+已有水位时只投影水位后的群事实。观察增量超限时会移除其中最旧记录；单条记录仍超限时保留元数据、内容尾部和 `get_message`
 查询提示。更早的完整记录始终保留在 JSONL 中，可通过历史工具读取。
 
 插件热重载或 `/gaf_clear` 会让旧调度 run 失效。旧 run 后续的 cursor、窗口和动作事实回写会被

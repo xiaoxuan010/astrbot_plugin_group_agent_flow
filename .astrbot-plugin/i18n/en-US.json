@@ -37,10 +37,6 @@
         "description": "Maximum observation context tokens",
         "hint": "Uses AstrBot Core's token counter. The latest observation block drops its oldest records first when it alone exceeds the budget; older records remain searchable through history tools."
       },
-      "rotation_retention_ratio": {
-        "description": "Context retained after block rotation",
-        "hint": "When the token budget overflows, oldest complete blocks are removed until usage reaches this fraction. Runtime values are constrained to 0.1-0.9."
-      },
       "max_log_records": {
         "description": "Maximum persisted records per group",
         "hint": "0 disables retention trimming."

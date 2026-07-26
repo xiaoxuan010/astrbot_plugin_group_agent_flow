@@ -249,6 +249,17 @@ class GroupFlowStore:
         except (TypeError, ValueError):
             return 0
 
+    def get_history_cursor(self, flow_id: str, conversation_id: str) -> int | None:
+        """返回已写入 Core 会话历史的群事实水位。"""
+        histories = self.read_state().get("history_cursors", {})
+        if not isinstance(histories, dict):
+            return None
+        try:
+            value = int(histories.get(self._cursor_key(flow_id, conversation_id)))
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
     def set_cursor(
         self,
         flow_id: str,
@@ -302,79 +313,18 @@ class GroupFlowStore:
     def get_or_assign_renderer(
         self, flow_id: str, conversation_id: str, default_renderer: str
     ) -> str:
-        """在会话生命周期内固定使用同一个 renderer。"""
+        """记录并返回当前轮使用的 renderer，配置变更在下一轮生效。"""
         state = self.read_state()
         assignments = state.setdefault("renderer_assignments", {})
         if not isinstance(assignments, dict):
             assignments = {}
             state["renderer_assignments"] = assignments
         key = self._cursor_key(flow_id, conversation_id)
-        assigned = str(assignments.get(key) or "")
-        if assigned:
-            return assigned
         assigned = str(default_renderer)
-        assignments[key] = assigned
-        self.write_state(state)
+        if assignments.get(key) != assigned:
+            assignments[key] = assigned
+            self.write_state(state)
         return assigned
-
-    @staticmethod
-    def _normalize_observation_window(value: Any) -> dict[str, Any] | None:
-        """校验活动窗口结构，并返回与持久化对象解耦的副本。"""
-        if not isinstance(value, dict):
-            return None
-        renderer = str(value.get("renderer") or "")
-        raw_blocks = value.get("blocks")
-        if not renderer or not isinstance(raw_blocks, list):
-            return None
-
-        blocks: list[dict[str, int]] = []
-        previous_end = 0
-        for raw_block in raw_blocks:
-            if not isinstance(raw_block, dict):
-                return None
-            try:
-                start_seq = int(raw_block.get("start_seq") or 0)
-                end_seq = int(raw_block.get("end_seq") or 0)
-            except (TypeError, ValueError):
-                return None
-            if start_seq <= 0 or end_seq < start_seq or start_seq <= previous_end:
-                return None
-            blocks.append({"start_seq": start_seq, "end_seq": end_seq})
-            previous_end = end_seq
-        return {"renderer": renderer, "blocks": blocks}
-
-    def get_observation_window(
-        self, flow_id: str, conversation_id: str
-    ) -> dict[str, Any] | None:
-        """返回会话当前活动 observation 块窗口。"""
-        windows = self.read_state().get("observation_windows", {})
-        if not isinstance(windows, dict):
-            return None
-        return self._normalize_observation_window(
-            windows.get(self._cursor_key(flow_id, conversation_id))
-        )
-
-    def set_observation_window(
-        self,
-        flow_id: str,
-        conversation_id: str,
-        *,
-        renderer_name: str,
-        blocks: list[dict[str, int]],
-    ) -> None:
-        """持久化会话活动窗口的稳定块边界。"""
-        normalized = self._normalize_observation_window(
-            {"renderer": renderer_name, "blocks": blocks}
-        )
-        if normalized is None:
-            raise ValueError("invalid observation window")
-        state = self.read_state()
-        windows = state.setdefault("observation_windows", {})
-        if not isinstance(windows, dict):
-            windows = {}
-            state["observation_windows"] = windows
-        windows[self._cursor_key(flow_id, conversation_id)] = normalized
-        self.write_state(state)
 
     def commit_observation(
         self,
@@ -383,15 +333,9 @@ class GroupFlowStore:
         seq: int,
         *,
         unified_msg_origin: str,
-        renderer_name: str,
-        blocks: list[dict[str, int]],
+        history_cursor: int,
     ) -> None:
-        """在一次 state 文件替换中提交 cursor 与活动窗口。"""
-        normalized = self._normalize_observation_window(
-            {"renderer": renderer_name, "blocks": blocks}
-        )
-        if normalized is None:
-            raise ValueError("invalid observation window")
+        """在一次 state 文件替换中提交 cursor 与 Core 历史水位。"""
         state = self.read_state()
         self._apply_cursor_state(
             state,
@@ -400,11 +344,12 @@ class GroupFlowStore:
             seq,
             unified_msg_origin=unified_msg_origin,
         )
-        windows = state.setdefault("observation_windows", {})
-        if not isinstance(windows, dict):
-            windows = {}
-            state["observation_windows"] = windows
-        windows[self._cursor_key(flow_id, conversation_id)] = normalized
+        histories = state.setdefault("history_cursors", {})
+        if not isinstance(histories, dict):
+            histories = {}
+            state["history_cursors"] = histories
+        key = self._cursor_key(flow_id, conversation_id)
+        histories[key] = max(int(histories.get(key) or 0), int(history_cursor))
         self.write_state(state)
 
     def clear_flow(self, flow_id: str) -> None:
@@ -419,7 +364,7 @@ class GroupFlowStore:
             "cursors",
             "cursor_meta",
             "renderer_assignments",
-            "observation_windows",
+            "history_cursors",
         ):
             section = state.get(section_name, {})
             if isinstance(section, dict):

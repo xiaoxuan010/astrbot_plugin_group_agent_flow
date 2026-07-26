@@ -63,7 +63,7 @@ Different Providers use that field for role-play replies or control statements s
 - Multiple actions in one Provider tool batch update the same run outcome from the complete
   accumulated action list; success plus failure becomes `action_partial`.
 - A response containing content `A` and `send_message("B")` sends only `B`.
-- A pure final assistant response is cleared and its runtime message is marked `_no_save`.
+- A pure final assistant response is cleared and removed from `run_context.messages`; prior tool-call and tool-result messages remain.
 - Content attached to a tool call remains internal Provider history and never reaches QQ.
 - An attempted external action returns `{success, action}` or `{success:false, action, error}`;
   a safe `fact_error` reports action-fact encoding or persistence failure. It leaves cursor
@@ -110,7 +110,7 @@ Different Providers use that field for role-play replies or control statements s
 - Policy test asserts ordinary LLM content creates zero original-sender calls.
 - Tool boundary test asserts only `B` reaches the original sender for content `A` plus tool `B`.
 - Isolation tests assert reasoning and general results create zero sends.
-- History test asserts a suppressed pure assistant message is marked `_no_save`.
+- History test asserts a suppressed pure assistant message is removed while the preceding tool chain remains.
 - Core-executor test asserts a valid external handler produces a structured result while
   `stay_silent` produces AstrBot's terminal `[None]` signal.
 - Runner integration asserts an action produces a QQ gateway call and `agent_action`, then a

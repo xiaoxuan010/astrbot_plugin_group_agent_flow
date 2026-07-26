@@ -37,10 +37,6 @@
         "description": "观察上下文最大 token 数",
         "hint": "使用 AstrBot Core 的 token 计数器。最新观察块单独超限时会优先裁剪其中的旧记录；更早记录仍可通过历史工具检索。"
       },
-      "rotation_retention_ratio": {
-        "description": "块轮转后的上下文保留比例",
-        "hint": "token 预算溢出时，从最旧完整块开始移除，直至用量降到该比例。运行时取值范围为 0.1-0.9。"
-      },
       "max_log_records": {
         "description": "每群最大持久化记录数",
         "hint": "0 表示不裁剪历史记录。"

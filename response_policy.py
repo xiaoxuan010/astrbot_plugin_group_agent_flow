@@ -95,15 +95,19 @@ def isolate_platform_metadata(event: Any) -> None:
 
 
 def suppress_direct_output(response: Any, *, run_context: Any = None) -> bool:
-    """从发送结果和可选会话历史中移除普通 assistant 输出。"""
+    """从发送结果与会话历史中移除本轮普通 assistant 输出。"""
     if response is None:
         return False
     had_direct_output = bool(getattr(response, "completion_text", ""))
     response.completion_text = ""
     response.result_chain = None
     messages = getattr(run_context, "messages", None)
-    if messages and getattr(response, "role", "assistant") == "assistant":
+    if (
+        had_direct_output
+        and messages
+        and getattr(response, "role", "assistant") == "assistant"
+    ):
         last_message = messages[-1]
         if getattr(last_message, "role", None) == "assistant":
-            last_message._no_save = True
+            messages.pop()
     return had_direct_output

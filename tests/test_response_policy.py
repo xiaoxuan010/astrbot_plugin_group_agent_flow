@@ -13,7 +13,7 @@ from response_policy import (
 )
 
 
-def test_suppress_direct_output_clears_response_and_marks_history_message_no_save():
+def test_suppress_direct_output_removes_terminal_plain_assistant_from_history():
     response = SimpleNamespace(
         completion_text="ordinary assistant output", result_chain=object()
     )
@@ -25,7 +25,21 @@ def test_suppress_direct_output_clears_response_and_marks_history_message_no_sav
     assert had_direct_output is True
     assert response.completion_text == ""
     assert response.result_chain is None
-    assert assistant_message._no_save is True
+    assert run_context.messages == []
+
+
+def test_suppress_direct_output_keeps_prior_tool_call_and_result_history():
+    response = SimpleNamespace(completion_text="ordinary", result_chain=object())
+    tool_call_assistant = SimpleNamespace(role="assistant", tool_calls=[object()])
+    tool_result = SimpleNamespace(role="tool", tool_call_id="call-1")
+    terminal_assistant = SimpleNamespace(role="assistant", content="already sent by tool")
+    run_context = SimpleNamespace(
+        messages=[tool_call_assistant, tool_result, terminal_assistant]
+    )
+
+    suppress_direct_output(response, run_context=run_context)
+
+    assert run_context.messages == [tool_call_assistant, tool_result]
 
 
 def test_suppress_direct_output_handles_missing_response():

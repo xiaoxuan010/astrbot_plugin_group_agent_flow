@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Plain, Poke, Reply
+from astrbot.api.message_components import At, Plain, Reply
 
 try:
+    from .context_renderers import format_group_timestamp
     from .response_policy import tool_send
 except ImportError:
+    from context_renderers import format_group_timestamp
     from response_policy import tool_send
 
 # Agent 使用 QQ 原生表情名称，协议编号集中在适配层维护。
@@ -27,6 +30,7 @@ QQ_REACTION_IDS = {
     "捂脸": "264",
 }
 SUPPORTED_REACTIONS = tuple(QQ_REACTION_IDS)
+MESSAGE_SEND_ACTIONS = frozenset({"send_message", "reply_message"})
 
 
 class QQActionGateway:
@@ -38,6 +42,44 @@ class QQActionGateway:
         chain = [At(qq=str(user_id)) for user_id in mentions or []]
         chain.append(Plain(str(content)))
         return MessageChain(chain=chain)
+
+    async def failure_detail(
+        self,
+        event: Any,
+        *,
+        action_name: str,
+        exc: Exception,
+    ) -> str:
+        """用实时群状态补充 QQNT 未解释的消息发送失败。"""
+        platform_error = str(exc)
+        if (
+            action_name not in MESSAGE_SEND_ACTIONS
+            or "NodeIKernelMsgService/sendMsg" not in platform_error
+        ):
+            return platform_error
+
+        bot = getattr(event, "bot", None)
+        group_id = str(event.get_group_id() or "")
+        self_id = str(event.get_self_id() or "")
+        if bot is None or not hasattr(bot, "call_action") or not group_id or not self_id:
+            return platform_error
+
+        try:
+            member = await bot.call_action(
+                "get_group_member_info",
+                group_id=int(group_id) if group_id.isdigit() else group_id,
+                user_id=int(self_id) if self_id.isdigit() else self_id,
+                no_cache=True,
+                self_id=int(self_id) if self_id.isdigit() else self_id,
+            )
+            mute_until = int(member.get("shut_up_timestamp") or 0)
+            if mute_until <= int(time.time()):
+                return platform_error
+            release_time = format_group_timestamp(mute_until, strict=True)
+        except Exception:
+            return platform_error
+        else:
+            return f"你已被禁言，无法发送消息；解禁时间：{release_time}"
 
     async def send_message(
         self,
@@ -114,11 +156,22 @@ class QQActionGateway:
         }
 
     async def poke_user(self, event: Any, *, user_id: str) -> dict[str, Any]:
-        """通过 AstrBot 原生 Poke 组件戳当前群成员。"""
+        """通过 NapCat 群戳一戳 Action 操作当前群成员。"""
         target_id = str(user_id).strip()
         if not target_id:
             raise ValueError("poke target user_id is required")
-        await tool_send(event, MessageChain(chain=[Poke(id=target_id)]))
+
+        bot = getattr(event, "bot", None)
+        group_id = str(event.get_group_id() or "")
+        self_id = str(event.get_self_id() or "")
+        if bot is None or not hasattr(bot, "call_action") or not group_id:
+            raise RuntimeError("current platform does not support QQ group poke")
+        await bot.call_action(
+            "group_poke",
+            group_id=group_id,
+            user_id=target_id,
+            self_id=int(self_id) if self_id.isdigit() else self_id,
+        )
         return {
             "success": True,
             "action": "poke_user",

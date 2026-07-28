@@ -160,19 +160,25 @@ class ToolRuntime:
         try:
             action_result = await operation()
         except Exception as exc:
+            detail = await self.gateway.failure_detail(
+                event,
+                action_name=action_name,
+                exc=exc,
+            )
             record_external_action(
                 event,
                 action_name=action_name,
                 success=False,
-                detail=str(exc),
+                detail=detail,
             )
-            return _json(
-                {
-                    "success": False,
-                    "action": action_name,
-                    "error": type(exc).__name__,
-                }
-            )
+            result = {
+                "success": False,
+                "action": action_name,
+                "error": type(exc).__name__,
+            }
+            if detail:
+                result["detail"] = detail
+            return _json(result)
         else:
             actions = event.get_extra(EXTERNAL_ACTIONS_EXTRA, [])
             action_index = len(actions) + 1 if isinstance(actions, list) else 1

@@ -65,9 +65,16 @@ Different Providers use that field for role-play replies or control statements s
 - A response containing content `A` and `send_message("B")` sends only `B`.
 - A pure final assistant response is cleared and removed from `run_context.messages`; prior tool-call and tool-result messages remain.
 - Content attached to a tool call remains internal Provider history and never reaches QQ.
-- An attempted external action returns `{success, action}` or `{success:false, action, error}`;
-  a safe `fact_error` reports action-fact encoding or persistence failure. It leaves cursor
-  persistence to the unified response finalizer.
+- An attempted external action returns `{success, action}` or
+  `{success:false, action, error, detail?}`. A non-empty `str(exc)` is the default `detail`
+  and is recorded on the failed action; an empty diagnostic omits the optional field. For
+  `send_message` and `reply_message`, a QQNT `sendMsg` failure queries the
+  current bot through `get_group_member_info(no_cache=true)`. A future
+  `shut_up_timestamp` produces
+  `你已被禁言，无法发送消息；解禁时间：<ISO time>` using the same
+  `Asia/Shanghai` ISO 8601 format as injected group-event timestamps and without the raw platform error;
+  query failure preserves the original platform diagnostic. A safe `fact_error` reports action-fact encoding or
+  persistence failure. It leaves cursor persistence to the unified response finalizer.
 - `stay_silent` sets `_group_agent_silence_selected=True`, invokes the same terminal callback,
   records `silence_selected`, advances the pending cursor, and returns terminal `None` without
   sending to QQ or appending `_group_agent_external_actions`.
@@ -80,7 +87,14 @@ Different Providers use that field for role-play replies or control statements s
 - `reasoning` chain -> blocked with no action record.
 - General/provider error result -> blocked without hiding a previous persisted assistant message.
 - Internal tool status chain -> blocked with no action record.
-- QQ sender exception -> failed explicit action record plus structured error.
+- QQ sender exception -> failed explicit action record plus structured error; a non-empty
+  platform diagnostic is returned to the model as `detail`.
+- QQNT `sendMsg` failure plus current bot `shut_up_timestamp > now` -> failed action with
+  a concise Chinese mute detail and no raw platform error.
+- Mute-status query failure, missing/non-numeric/out-of-range `shut_up_timestamp`, or expired
+  timestamp -> failed action with the original platform error. Validate and format a future
+  timestamp in one guarded block because the context renderer intentionally maps invalid event
+  timestamps to the Unix epoch.
 - Action fact encoding failure after a successful send -> `action_succeeded` plus safe encoding
   detail in a structured result.
 - Action fact write failure after a successful send -> `action_succeeded` plus safe persistence
@@ -97,6 +111,8 @@ Different Providers use that field for role-play replies or control statements s
 ### 5. Good/Base/Bad Cases
 
 - Good: `content="A"` plus `send_message("B")` sends only `B` and terminates the loop.
+- Good: a QQNT `sendMsg` failure while the current bot has a future
+  `shut_up_timestamp` returns an explicit Chinese mute detail and `+08:00` ISO release time.
 - Good: a read-only lookup followed by `stay_silent()` sends nothing, records
   `silence_selected`, and advances the cursor.
 - Base: `No Action Needed` with no tool sends nothing and records `direct_output_suppressed`.
@@ -113,6 +129,12 @@ Different Providers use that field for role-play replies or control statements s
 - History test asserts a suppressed pure assistant message is removed while the preceding tool chain remains.
 - Core-executor test asserts a valid external handler produces a structured result while
   `stay_silent` produces AstrBot's terminal `[None]` signal.
+- External-action failure tests assert ordinary exception text and `ActionFailed` platform
+  diagnostics reach the model as `detail`, while an empty diagnostic omits the field.
+- Mute-diagnostic tests assert `get_group_member_info` uses the current group and bot with
+  `no_cache=true`, a future `shut_up_timestamp` returns only the concise Chinese mute
+  detail with the shared `Asia/Shanghai` ISO time format, and query failure or an out-of-range
+  timestamp preserves the original `ActionFailed` diagnostic.
 - Runner integration asserts an action produces a QQ gateway call and `agent_action`, then a
   follow-up Provider call can select `stay_silent`.
 - Batch tests assert later actions update the same run to the final succeeded/failed/partial
@@ -139,6 +161,11 @@ emit text.
 
 Correct: require `stay_silent()` as the explicit zero-side-effect terminal choice and keep
 ordinary text classified as `direct_output_suppressed`.
+
+Wrong: translate QQNT `sendMsg result=120` directly to `bot_muted`.
+
+Correct: verify the current bot's live `shut_up_timestamp`, then replace the model-visible
+platform error with the concise mute reason while that timestamp is in the future.
 
 Avoid broad exception handling around pure logic. At external QQ boundaries, record enough
 detail for diagnostics while keeping credentials and full message content out of logs.
@@ -223,16 +250,19 @@ allow the Agent to poke a QQ identity already visible in its frozen snapshot.
 - `is_directed_at_bot` is true when the Poke target equals the event `self_id`.
 - A valid tool target appears at or before `snapshot_seq` as a record `sender_id`, an `at.user_id`,
   or a `poke.target_id`.
-- The gateway sends `MessageChain([Comp.Poke(id=user_id)])` through `tool_send()` and records
-  `poke_user` as the external action name.
+- The gateway calls NapCat `group_poke` with the current `group_id` and target `user_id`,
+  then records `poke_user` as the external action name. AstrBot's `Comp.Poke` remains the
+  inbound notice representation.
 - The action returns a structured result after the gateway attempt.
 
 ### 4. Validation & Error Matrix
 
 - Empty `user_id` -> `user_not_found_in_snapshot`; no gateway call.
 - User appears only after `snapshot_seq` -> `user_not_found_in_snapshot`; no gateway call.
-- User appears in the frozen snapshot -> send one native Poke component.
-- QQ sender exception -> failed `poke_user` action plus structured error.
+- User appears in the frozen snapshot -> call `group_poke` once.
+- Missing `bot.call_action` or current group -> failed `poke_user` action plus structured
+  `RuntimeError`.
+- NapCat `group_poke` exception -> failed `poke_user` action plus structured error.
 
 ### 5. Good/Base/Bad Cases
 
@@ -244,7 +274,8 @@ allow the Agent to poke a QQ identity already visible in its frozen snapshot.
 ### 6. Tests Required
 
 - Event-codec test asserts actor, target, semantic text, and directed detection.
-- Gateway test asserts one `Comp.Poke` with the requested `target_id` reaches the original sender.
+- Gateway test asserts one `group_poke` Action receives the current group and requested user,
+  while the normal message sender remains unused.
 - Tool-schema test asserts `poke_user` requires only `user_id`.
 - Snapshot test covers sender, mention, poke-target, and post-snapshot rejection.
 - Prompt test asserts `poke_user` stays out of the generic System Prompt.
@@ -255,3 +286,9 @@ Wrong: persist only `[ComponentType.Poke]` and expose a tool that accepts any ar
 
 Correct: persist actor and target explicitly, then validate the target against the frozen snapshot
 before crossing the QQ gateway.
+
+Wrong: send `Comp.Poke` through the normal QQ message chain; NapCat produces no send element
+and rejects the empty message body.
+
+Correct: keep `Comp.Poke` for inbound notice decoding and use NapCat `group_poke` for the
+outbound action.

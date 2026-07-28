@@ -5,6 +5,7 @@ import pytest
 
 import agent_tools as agent_tools_module
 from agent_tools import SILENCE_SELECTED_EXTRA, ToolRuntime
+from aiocqhttp.exceptions import ActionFailed
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
@@ -340,7 +341,10 @@ async def test_failed_external_action_returns_structured_error_and_records_failu
         )
     )
 
-    assert result == '{"success":false,"action":"send_message","error":"RuntimeError"}'
+    assert result == (
+        '{"success":false,"action":"send_message","error":"RuntimeError",'
+        '"detail":"qq unavailable"}'
+    )
     assert event.get_extra("_group_agent_external_actions") == [
         {
             "action_name": "send_message",
@@ -349,6 +353,171 @@ async def test_failed_external_action_returns_structured_error_and_records_failu
         }
     ]
     assert store.read_records("napcat:group:1") == []
+
+
+@pytest.mark.asyncio
+async def test_action_failed_result_returns_verified_bot_mute_to_model(tmp_path):
+    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    event = FakeEvent()
+    mute_until = 4_000_000_000
+    platform_result = {
+        "status": "failed",
+        "retcode": 1200,
+        "data": None,
+        "message": (
+            "EventChecker Failed: NodeIKernelMsgService/sendMsg "
+            'EventRet: {"result": 120, "errMsg": ""}'
+        ),
+        "wording": (
+            "EventChecker Failed: NodeIKernelMsgService/sendMsg "
+            'EventRet: {"result": 120, "errMsg": ""}'
+        ),
+        "echo": {"seq": 129},
+        "stream": "normal-action",
+    }
+    failure = ActionFailed(platform_result)
+
+    async def fail_send(_chain):
+        raise failure
+
+    async def get_member(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        return {"shut_up_timestamp": mute_until}
+
+    event.send = fail_send
+    event.bot.call_action = get_member
+
+    result = json.loads(
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(event, content="A")
+    )
+
+    assert result == {
+        "success": False,
+        "action": "send_message",
+        "error": "ActionFailed",
+        "detail": "你已被禁言，无法发送消息；解禁时间：2096-10-02T15:06:40+08:00",
+    }
+    assert event.bot.actions == [
+        (
+            "get_group_member_info",
+            {
+                "group_id": 1,
+                "user_id": 7,
+                "no_cache": True,
+                "self_id": 7,
+            },
+        )
+    ]
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": "send_message",
+            "status": "failed",
+            "detail": (
+                "你已被禁言，无法发送消息；"
+                "解禁时间：2096-10-02T15:06:40+08:00"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mute_status_query_failure_preserves_platform_diagnostic(tmp_path):
+    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    event = FakeEvent()
+    failure = ActionFailed(
+        {
+            "status": "failed",
+            "retcode": 1200,
+            "data": None,
+            "message": "NodeIKernelMsgService/sendMsg result=120",
+            "wording": "NodeIKernelMsgService/sendMsg result=120",
+        }
+    )
+
+    async def fail_send(_chain):
+        raise failure
+
+    async def fail_status_query(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        raise RuntimeError("status unavailable")
+
+    event.send = fail_send
+    event.bot.call_action = fail_status_query
+
+    result = json.loads(
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(event, content="A")
+    )
+
+    assert result["error"] == "ActionFailed"
+    assert result["detail"] == str(failure)
+    assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(
+        failure
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_mute_timestamp_preserves_platform_diagnostic(tmp_path):
+    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    event = FakeEvent()
+    failure = ActionFailed(
+        {
+            "status": "failed",
+            "retcode": 1200,
+            "data": None,
+            "message": "NodeIKernelMsgService/sendMsg result=120",
+            "wording": "NodeIKernelMsgService/sendMsg result=120",
+        }
+    )
+
+    async def fail_send(_chain):
+        raise failure
+
+    async def get_invalid_member(_action, **_kwargs):
+        return {"shut_up_timestamp": 10**100}
+
+    event.send = fail_send
+    event.bot.call_action = get_invalid_member
+
+    result = json.loads(
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(event, content="A")
+    )
+
+    assert result["detail"] == str(failure)
+    assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(
+        failure
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_action_failure_omits_empty_detail(tmp_path):
+    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    event = FakeEvent()
+
+    async def fail_send(_chain):
+        raise RuntimeError
+
+    event.send = fail_send
+
+    result = (
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(event, content="A")
+    )
+
+    assert result == '{"success":false,"action":"send_message","error":"RuntimeError"}'
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": "send_message",
+            "status": "failed",
+            "detail": "",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -672,10 +841,17 @@ async def test_poke_user_only_targets_users_observed_in_frozen_snapshot(tmp_path
         await tools.get_tool("poke_user").handler(event, user_id="future")
     )
 
-    assert [chain.chain[0].target_id() for chain in event.sent] == [
-        "alice",
-        "bob",
-        "carol",
+    assert event.sent == []
+    assert event.bot.actions == [
+        (
+            "group_poke",
+            {
+                "group_id": "1",
+                "user_id": user_id,
+                "self_id": 7,
+            },
+        )
+        for user_id in ("alice", "bob", "carol")
     ]
     assert rejected == {
         "success": False,

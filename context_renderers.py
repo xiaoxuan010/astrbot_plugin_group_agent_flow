@@ -24,6 +24,13 @@ def _datetime(timestamp: Any) -> datetime:
         return datetime.fromtimestamp(0, tz=SHANGHAI_TZ)
 
 
+def format_group_timestamp(timestamp: Any, *, strict: bool = False) -> str:
+    """按群聊上下文约定输出带上海时区的 ISO 时间。"""
+    if strict:
+        return datetime.fromtimestamp(int(timestamp), tz=SHANGHAI_TZ).isoformat()
+    return _datetime(timestamp).isoformat()
+
+
 def _is_agent_action(event: dict[str, Any]) -> bool:
     """识别插件生成的机器人动作事实。"""
     return _one_line(event.get("record_kind")) == "agent_action"
@@ -38,7 +45,7 @@ def _agent_action_line(event: dict[str, Any]) -> str:
         f"action={_one_line(event.get('action_name'))}",
         f"status={_one_line(event.get('action_status'))}",
         f"action_id={_one_line(event.get('message_id'))}",
-        f"time={_datetime(event.get('timestamp')).isoformat()}",
+        f"time={format_group_timestamp(event.get('timestamp'))}",
     ]
     target_message_id = _one_line(
         event.get("target_message_id") or event.get("reply_to")
@@ -62,7 +69,7 @@ def _structured_line(event: dict[str, Any]) -> str:
         f"msg={_one_line(event.get('message_id'))}",
         f"sender={_one_line(event.get('sender_id'))}",
         f"name={_one_line(event.get('sender_name'))}",
-        f"time={_datetime(event.get('timestamp')).isoformat()}",
+        f"time={format_group_timestamp(event.get('timestamp'))}",
     ]
     reply_to = _one_line(event.get("reply_to"))
     if reply_to:
@@ -87,7 +94,7 @@ def _xml_text(value: Any) -> str:
 
 def _xml_timestamp(value: Any) -> str:
     """将存在的组件时间统一投影为带时区的 ISO 时间。"""
-    return _datetime(value).isoformat() if _one_line(value) else ""
+    return format_group_timestamp(value) if _one_line(value) else ""
 
 
 def _xml_component(component: dict[str, Any]) -> str:

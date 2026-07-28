@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-from astrbot.api import message_components as Comp
 
 from qq_gateway import QQActionGateway
 
@@ -14,6 +13,12 @@ class FakeEvent:
 
     async def send(self, chain):
         self.sent.append(chain)
+
+    def get_group_id(self):
+        return "1"
+
+    def get_self_id(self):
+        return "7"
 
 
 class FakeBot:
@@ -124,16 +129,23 @@ async def test_react_message_rejects_unknown_semantic_reaction():
 
 
 @pytest.mark.asyncio
-async def test_poke_user_builds_native_poke_chain():
+async def test_poke_user_calls_napcat_group_poke_action():
     event = FakeEvent()
     gateway = QQActionGateway()
 
     result = await gateway.poke_user(event, user_id="10001")
 
-    chain = event.sent[0].chain
-    assert len(chain) == 1
-    assert isinstance(chain[0], Comp.Poke)
-    assert chain[0].target_id() == "10001"
+    assert event.sent == []
+    assert event.bot.actions == [
+        (
+            "group_poke",
+            {
+                "group_id": "1",
+                "user_id": "10001",
+                "self_id": 7,
+            },
+        )
+    ]
     assert result == {
         "success": True,
         "action": "poke_user",

@@ -7,6 +7,8 @@ from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.utils.media_utils import resolve_image_ref_to_base64_data
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 try:
     from .event_codec import build_agent_action_record
@@ -48,10 +50,12 @@ class ToolRuntime:
             [str, str, int], Awaitable[bool]
         ]
         | None = None,
+        context: Any | None = None,
     ) -> None:
         """将持久化动作状态与 QQ 副作用网关组合起来。"""
         self.store = store
         self.gateway = gateway
+        self.context = context
         self.terminal_callback = terminal_callback
         self.action_persist_callback = (
             action_persist_callback or self._append_action_record
@@ -128,6 +132,41 @@ class ToolRuntime:
                 ):
                     return True
         return False
+
+    def _current_provider_supports_images(self, event: Any | None) -> bool:
+        """仅接受当前会话 Provider 显式声明的图片能力。"""
+        if self.context is None or event is None:
+            return False
+        try:
+            provider = self.context.get_using_provider(event.unified_msg_origin)
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] failed to inspect current provider capability "
+                f"error={type(exc).__name__}"
+            )
+            return False
+        if provider is None:
+            return False
+        provider_config = getattr(provider, "provider_config", None)
+        if not isinstance(provider_config, dict):
+            return False
+        modalities = provider_config.get("modalities")
+        return isinstance(modalities, list) and "image" in modalities
+
+    @staticmethod
+    def _message_image_refs(record: dict[str, Any]) -> list[str]:
+        """按组件顺序提取一条持久化消息中的有效图片引用。"""
+        components = record.get("components")
+        if not isinstance(components, list):
+            return []
+        refs = []
+        for component in components:
+            if not isinstance(component, dict) or component.get("type") != "image":
+                continue
+            image_ref = str(component.get("source_url") or component.get("url") or "")
+            if image_ref:
+                refs.append(image_ref)
+        return refs
 
     async def _external(
         self,
@@ -226,7 +265,7 @@ class ToolRuntime:
                 result["fact_error"] = detail
             return _json(result)
 
-    def build_tool_set(self) -> ToolSet:
+    def build_tool_set(self, event: Any | None = None) -> ToolSet:
         """为每次请求创建独立工具集，避免共享可变工具对象。"""
 
         async def send_message(
@@ -330,6 +369,153 @@ class ToolRuntime:
                 }
             )
 
+        async def get_message_images(
+            event: Any, message_id: str
+        ) -> str | CallToolResult:
+            """读取一条快照消息中的原图。"""
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
+            record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+            if record is None:
+                return _json(
+                    {
+                        "error": "message_not_found_in_snapshot",
+                        "message_id": message_id,
+                    }
+                )
+            image_refs = self._message_image_refs(record)
+            if not image_refs:
+                return _json(
+                    {
+                        "error": "message_contains_no_images",
+                        "message_id": message_id,
+                    }
+                )
+
+            async def build_image_result(image_refs: list[str]) -> CallToolResult:
+                content: list[TextContent | ImageContent] = [
+                    TextContent(
+                        type="text",
+                        text=_json(
+                            {
+                                "message_id": message_id,
+                                "image_count": len(image_refs),
+                            }
+                        ),
+                    )
+                ]
+                for image_ref in image_refs:
+                    resolved = await resolve_image_ref_to_base64_data(
+                        image_ref,
+                        strict=True,
+                    )
+                    if resolved is None:
+                        raise ValueError("image reference could not be resolved")
+                    content.append(
+                        ImageContent(
+                            type="image",
+                            data=resolved.base64_data,
+                            mimeType=resolved.mime_type,
+                        )
+                    )
+                return CallToolResult(content=content)
+            try:
+                return await build_image_result(image_refs)
+            except Exception as initial_exc:
+                failure = initial_exc
+                try:
+                    refreshed_refs = await self.gateway.refresh_message_images(
+                        event,
+                        message_id=message_id,
+                        message_seq=str(record.get("message_seq") or ""),
+                    )
+                    if refreshed_refs:
+                        return await build_image_result(refreshed_refs)
+                except Exception as exc:
+                    failure = exc
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] failed to refresh observed image "
+                        f"message_id={message_id} error={type(exc).__name__}"
+                    )
+            logger.warning(
+                f"[{PLUGIN_NAME}] failed to resolve observed image "
+                f"message_id={message_id} error={type(failure).__name__}"
+            )
+            return _json(
+                {
+                    "error": "image_unavailable",
+                    "message_id": message_id,
+                }
+            )
+
+        async def get_image_captions(event: Any, message_id: str) -> str:
+            """读取一条快照消息中的图片转述。"""
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
+            record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+            if record is None:
+                return _json(
+                    {
+                        "error": "message_not_found_in_snapshot",
+                        "message_id": message_id,
+                    }
+                )
+            image_refs = self._message_image_refs(record)
+            if not image_refs:
+                return _json(
+                    {
+                        "error": "message_contains_no_images",
+                        "message_id": message_id,
+                    }
+                )
+            if self.context is None:
+                return _json({"error": "image_caption_provider_unconfigured"})
+            provider_id = ""
+            try:
+                config = self.context.get_config(umo=event.unified_msg_origin)
+                provider_settings = (
+                    config.get("provider_settings", {})
+                    if isinstance(config, dict)
+                    else {}
+                )
+                if not isinstance(provider_settings, dict):
+                    provider_settings = {}
+                provider_id = str(
+                    provider_settings.get("default_image_caption_provider_id") or ""
+                )
+                if not provider_id:
+                    return _json({"error": "image_caption_provider_unconfigured"})
+                prompt = str(
+                    provider_settings.get("image_caption_prompt")
+                    or "Please describe the image using Chinese."
+                )
+                provider = self.context.get_provider_by_id(provider_id)
+                if provider is None:
+                    raise ValueError("image caption provider unavailable")
+                response = await provider.text_chat(
+                    prompt=prompt,
+                    image_urls=image_refs,
+                )
+                caption = str(getattr(response, "completion_text", "") or "").strip()
+                if not caption:
+                    raise ValueError("image caption provider returned empty content")
+                return _json(
+                    {
+                        "message_id": message_id,
+                        "caption": caption,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] image caption request failed "
+                    f"message_id={message_id} provider_id={provider_id} "
+                    f"error={type(exc).__name__}"
+                )
+                return _json(
+                    {
+                        "error": "image_caption_failed",
+                        "message_id": message_id,
+                    }
+                )
+
         async def search_chat_history(
             event: Any,
             query: str = "",
@@ -352,8 +538,7 @@ class ToolRuntime:
             return _json({"messages": messages})
 
         string_array = {"type": "array", "items": {"type": "string"}}
-        return ToolSet(
-            [
+        tools = [
                 FunctionTool(
                     name="send_message",
                     description="Send one message to the current group.",
@@ -455,5 +640,43 @@ class ToolRuntime:
                     },
                     handler=search_chat_history,
                 ),
-            ]
-        )
+        ]
+        if self._current_provider_supports_images(event):
+            tools.insert(
+                -1,
+                FunctionTool(
+                    name="get_message_images",
+                    description="View images from one observed group message.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": "Exact message ID shown as msg=... in the observed context.",
+                            }
+                        },
+                        "required": ["message_id"],
+                    },
+                    handler=get_message_images,
+                ),
+            )
+        else:
+            tools.insert(
+                -1,
+                FunctionTool(
+                    name="get_image_captions",
+                    description="Describe images from one observed group message.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": "Exact message ID shown as msg=... in the observed context.",
+                            }
+                        },
+                        "required": ["message_id"],
+                    },
+                    handler=get_image_captions,
+                ),
+            )
+        return ToolSet(tools)

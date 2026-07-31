@@ -12,6 +12,7 @@ from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunne
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest, TokenUsage
 from astrbot.core.provider.provider import Provider
+from mcp.types import CallToolResult, ImageContent, TextContent
 from qq_gateway import QQActionGateway
 from store import GroupFlowStore
 
@@ -28,6 +29,7 @@ class FakeBot:
 class FakeEvent:
     def __init__(self):
         self.bot = FakeBot()
+        self.unified_msg_origin = "napcat:group:1"
         self.message_obj = SimpleNamespace(
             raw_message={},
             group=SimpleNamespace(group_name="测试群"),
@@ -64,6 +66,22 @@ class FakeEvent:
 
     async def send(self, chain):
         self.sent.append(chain)
+
+
+class FakeContext:
+    def __init__(self, *, using_provider=None, config=None, providers=None):
+        self.using_provider = using_provider
+        self.config = config or {}
+        self.providers = providers or {}
+
+    def get_using_provider(self, umo=None):
+        return self.using_provider
+
+    def get_config(self, umo=None):
+        return self.config
+
+    def get_provider_by_id(self, provider_id):
+        return self.providers.get(provider_id)
 
 
 class ConsecutiveActionProvider(Provider):
@@ -122,6 +140,7 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
         "poke_user",
         "stay_silent",
         "get_message",
+        "get_image_captions",
         "search_chat_history",
     ]
     assert tool_set.get_tool("stay_silent").parameters == {
@@ -158,9 +177,506 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
         "observed"
         in poke_tool.parameters["properties"]["user_id"]["description"].lower()
     )
-    for tool_name in ("reply_message", "react_message", "get_message"):
+    for tool_name in (
+        "reply_message",
+        "react_message",
+        "get_message",
+        "get_image_captions",
+    ):
         tool = tool_set.get_tool(tool_name)
         assert "msg=" in tool.parameters["properties"]["message_id"]["description"]
+
+
+@pytest.mark.parametrize(
+    (
+        "modalities",
+        "exposes_original_images",
+        "exposes_image_captions",
+    ),
+    [
+        (["text", "image", "tool_use"], True, False),
+        (["text", "tool_use"], False, True),
+        ([], False, True),
+        (None, False, True),
+        ("text,image", False, True),
+    ],
+)
+def test_image_tool_visibility_follows_explicit_provider_capability(
+    tmp_path,
+    modalities,
+    exposes_original_images,
+    exposes_image_captions,
+):
+    provider_config = {}
+    if modalities is not None:
+        provider_config["modalities"] = modalities
+    context = FakeContext(
+        using_provider=SimpleNamespace(provider_config=provider_config)
+    )
+    event = FakeEvent()
+    runtime = ToolRuntime(
+        GroupFlowStore(tmp_path),
+        QQActionGateway(),
+        context=context,
+    )
+
+    names = runtime.build_tool_set(event).names()
+
+    assert ("get_message_images" in names) is exposes_original_images
+    assert ("get_image_captions" in names) is exposes_image_captions
+
+
+def test_image_tool_visibility_hides_original_when_provider_lookup_fails(tmp_path):
+    class FailingContext(FakeContext):
+        def get_using_provider(self, umo=None):
+            raise ValueError("invalid session provider")
+
+    names = ToolRuntime(
+        GroupFlowStore(tmp_path),
+        QQActionGateway(),
+        context=FailingContext(),
+    ).build_tool_set(FakeEvent()).names()
+
+    assert "get_message_images" not in names
+    assert "get_image_captions" in names
+
+
+@pytest.mark.asyncio
+async def test_get_message_images_returns_core_multimodal_content(
+    tmp_path,
+    monkeypatch,
+):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [
+                {
+                    "type": "image",
+                    "url": r"D:\\AstrBot\\data\\temp\\expired-a.png",
+                    "source_url": "https://example.com/a.png",
+                },
+                {"type": "text", "text": "两张图"},
+                {
+                    "type": "image",
+                    "url": r"D:\\AstrBot\\data\\temp\\expired-b.jpg",
+                    "source_url": "https://example.com/b.jpg",
+                },
+            ],
+        },
+    )
+    resolved_refs = []
+
+    async def resolve_image(image_ref, *, strict):
+        resolved_refs.append((image_ref, strict))
+        suffix = "png" if image_ref.endswith(".png") else "jpg"
+        return SimpleNamespace(
+            base64_data=f"base64-{suffix}",
+            mime_type=f"image/{'png' if suffix == 'png' else 'jpeg'}",
+        )
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "resolve_image_ref_to_base64_data",
+        resolve_image,
+        raising=False,
+    )
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": ["text", "image", "tool_use"]}
+        )
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool("get_message_images")
+
+    result = await tool.handler(event, message_id="m1")
+
+    assert isinstance(result, CallToolResult)
+    assert result.content == [
+        TextContent(
+            type="text",
+            text='{"message_id":"m1","image_count":2}',
+        ),
+        ImageContent(type="image", data="base64-png", mimeType="image/png"),
+        ImageContent(type="image", data="base64-jpg", mimeType="image/jpeg"),
+    ]
+    assert resolved_refs == [
+        ("https://example.com/a.png", True),
+        ("https://example.com/b.jpg", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_image_captions_uses_dedicated_provider(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [
+                {
+                    "type": "image",
+                    "url": r"D:\\AstrBot\\data\\temp\\expired-a.png",
+                    "source_url": "https://example.com/a.png",
+                },
+                {
+                    "type": "image",
+                    "url": r"D:\\AstrBot\\data\\temp\\expired-b.jpg",
+                    "source_url": "https://example.com/b.jpg",
+                },
+            ],
+        },
+    )
+
+    class CaptionProvider:
+        def __init__(self):
+            self.calls = []
+
+        async def text_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(completion_text="两张群聊截图，内容是部署结果。")
+
+    caption_provider = CaptionProvider()
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": ["text", "tool_use"]}
+        ),
+        config={
+            "provider_settings": {
+                "default_image_caption_provider_id": "caption-provider",
+                "image_caption_prompt": "请用一句中文描述图片。",
+            }
+        },
+        providers={"caption-provider": caption_provider},
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool("get_image_captions")
+
+    result = json.loads(await tool.handler(event, message_id="m1"))
+
+    assert result == {
+        "message_id": "m1",
+        "caption": "两张群聊截图，内容是部署结果。",
+    }
+    assert caption_provider.calls == [
+        {
+            "prompt": "请用一句中文描述图片。",
+            "image_urls": [
+                "https://example.com/a.png",
+                "https://example.com/b.jpg",
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "modalities"),
+    [
+        ("get_message_images", ["text", "image", "tool_use"]),
+        ("get_image_captions", ["text", "tool_use"]),
+    ],
+)
+async def test_image_tools_reject_messages_outside_snapshot(
+    tmp_path, tool_name, modalities
+):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [{"type": "text", "text": "快照内"}],
+        },
+    )
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m2",
+            "components": [
+                {"type": "image", "url": "https://example.com/future.png"}
+            ],
+        },
+    )
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": modalities}
+        )
+    )
+    event = FakeEvent()
+    event.extras["_group_agent_snapshot_seq"] = 1
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool(tool_name)
+
+    result = json.loads(await tool.handler(event, message_id="m2"))
+
+    assert result == {
+        "error": "message_not_found_in_snapshot",
+        "message_id": "m2",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "modalities"),
+    [
+        ("get_message_images", ["text", "image", "tool_use"]),
+        ("get_image_captions", ["text", "tool_use"]),
+    ],
+)
+async def test_image_tools_reject_messages_without_images(
+    tmp_path, tool_name, modalities
+):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [{"type": "text", "text": "只有文字"}],
+        },
+    )
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": modalities}
+        )
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool(tool_name)
+
+    result = json.loads(await tool.handler(event, message_id="m1"))
+
+    assert result == {
+        "error": "message_contains_no_images",
+        "message_id": "m1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_message_images_returns_compact_error_when_resolution_fails(
+    tmp_path,
+    monkeypatch,
+):
+    store = GroupFlowStore(tmp_path)
+    image_url = "https://secret.example/private.png"
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [{"type": "image", "url": image_url}],
+        },
+    )
+
+    async def fail_resolution(_image_ref, *, strict):
+        assert strict is True
+        raise RuntimeError(f"download failed: {image_url}")
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "resolve_image_ref_to_base64_data",
+        fail_resolution,
+    )
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": ["text", "image", "tool_use"]}
+        )
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool("get_message_images")
+
+    result_text = await tool.handler(event, message_id="m1")
+
+    assert json.loads(result_text) == {
+        "error": "image_unavailable",
+        "message_id": "m1",
+    }
+    assert image_url not in result_text
+    assert "download failed" not in result_text
+
+
+@pytest.mark.asyncio
+async def test_get_message_images_refreshes_expired_url_from_napcat(tmp_path, monkeypatch):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "message_seq": "77",
+            "components": [
+                {
+                    "type": "image",
+                    "url": r"D:\\AstrBot\\data\\temp\\expired.png",
+                    "source_url": "https://cdn.example.com/expired.png",
+                }
+            ],
+        },
+    )
+    resolved_refs = []
+
+    async def resolve_image(image_ref, *, strict):
+        resolved_refs.append((image_ref, strict))
+        if image_ref.endswith("expired.png"):
+            raise RuntimeError("HTTP status code: 400")
+        return SimpleNamespace(base64_data="fresh-base64", mime_type="image/jpeg")
+
+    class RefreshingGateway(QQActionGateway):
+        async def refresh_message_images(self, event, *, message_id, message_seq):
+            assert message_id == "m1"
+            assert message_seq == "77"
+            return ["https://cdn.example.com/fresh.jpg"]
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "resolve_image_ref_to_base64_data",
+        resolve_image,
+    )
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": ["text", "image", "tool_use"]}
+        )
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        RefreshingGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool("get_message_images")
+
+    result = await tool.handler(event, message_id="m1")
+
+    assert isinstance(result, CallToolResult)
+    assert [item.data for item in result.content if isinstance(item, ImageContent)] == [
+        "fresh-base64"
+    ]
+    assert resolved_refs == [
+        ("https://cdn.example.com/expired.png", True),
+        ("https://cdn.example.com/fresh.jpg", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_image_captions_reports_unconfigured_provider(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [
+                {"type": "image", "url": "https://example.com/a.png"}
+            ],
+        },
+    )
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": ["text", "tool_use"]}
+        )
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool("get_image_captions")
+
+    result = json.loads(await tool.handler(event, message_id="m1"))
+
+    assert result == {"error": "image_caption_provider_unconfigured"}
+
+
+@pytest.mark.asyncio
+async def test_get_image_captions_returns_compact_error_when_config_lookup_fails(
+    tmp_path,
+):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [
+                {"type": "image", "url": "https://example.com/a.png"}
+            ],
+        },
+    )
+
+    class FailingContext(FakeContext):
+        def get_config(self, umo=None):
+            raise RuntimeError("config contains a secret diagnostic")
+
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=FailingContext(),
+    ).build_tool_set(FakeEvent()).get_tool("get_image_captions")
+
+    result_text = await tool.handler(FakeEvent(), message_id="m1")
+
+    assert json.loads(result_text) == {
+        "error": "image_caption_failed",
+        "message_id": "m1",
+    }
+    assert "secret diagnostic" not in result_text
+
+
+@pytest.mark.asyncio
+async def test_get_image_captions_returns_compact_error_when_provider_fails(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    image_url = "https://secret.example/private.png"
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "components": [{"type": "image", "url": image_url}],
+        },
+    )
+
+    class FailingCaptionProvider:
+        async def text_chat(self, **_kwargs):
+            raise RuntimeError(f"provider failed for {image_url}")
+
+    context = FakeContext(
+        using_provider=SimpleNamespace(
+            provider_config={"modalities": ["text", "tool_use"]}
+        ),
+        config={
+            "provider_settings": {
+                "default_image_caption_provider_id": "caption-provider",
+            }
+        },
+        providers={"caption-provider": FailingCaptionProvider()},
+    )
+    event = FakeEvent()
+    tool = ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).build_tool_set(event).get_tool("get_image_captions")
+
+    result_text = await tool.handler(event, message_id="m1")
+
+    assert json.loads(result_text) == {
+        "error": "image_caption_failed",
+        "message_id": "m1",
+    }
+    assert image_url not in result_text
+    assert "provider failed" not in result_text
 
 
 @pytest.mark.asyncio

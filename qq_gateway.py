@@ -43,6 +43,91 @@ class QQActionGateway:
         chain.append(Plain(str(content)))
         return MessageChain(chain=chain)
 
+    @staticmethod
+    def _as_onebot_id(value: str) -> int | str:
+        """保留非数字平台 ID，并规范化纯数字 OneBot 参数。"""
+        normalized = str(value)
+        return int(normalized) if normalized.isdigit() else normalized
+
+    @staticmethod
+    def _onebot_image_urls(payload: Any) -> list[str]:
+        """从 OneBot 单条消息响应提取线上图片地址。"""
+        if not isinstance(payload, dict):
+            return []
+        message = payload.get("message")
+        if not isinstance(message, list):
+            data = payload.get("data")
+            message = data.get("message") if isinstance(data, dict) else None
+        if not isinstance(message, list):
+            return []
+        image_urls = []
+        for segment in message:
+            if not isinstance(segment, dict) or segment.get("type") != "image":
+                continue
+            data = segment.get("data")
+            url = str(data.get("url") or "") if isinstance(data, dict) else ""
+            if url.startswith(("https://", "http://")):
+                image_urls.append(url)
+        return image_urls
+
+    @staticmethod
+    def _history_messages(payload: Any) -> list[dict[str, Any]]:
+        """兼容 OneBot 实现返回的顶层或 data.messages 历史页。"""
+        if not isinstance(payload, dict):
+            return []
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            data = payload.get("data")
+            messages = data.get("messages") if isinstance(data, dict) else None
+        return [message for message in messages or [] if isinstance(message, dict)]
+
+    async def refresh_message_images(
+        self,
+        event: Any,
+        *,
+        message_id: str,
+        message_seq: str,
+    ) -> list[str]:
+        """从 NapCat 刷新已过期消息图片的线上地址。"""
+        bot = getattr(event, "bot", None)
+        if bot is None or not hasattr(bot, "call_action"):
+            return []
+
+        self_id = str(event.get_self_id() or "")
+        routing_params = {"self_id": self._as_onebot_id(self_id)} if self_id else {}
+        normalized_message_id = self._as_onebot_id(message_id)
+        try:
+            message = await bot.call_action(
+                "get_msg",
+                message_id=normalized_message_id,
+                **routing_params,
+            )
+        except Exception:
+            message = None
+        image_urls = self._onebot_image_urls(message)
+        if image_urls:
+            return image_urls
+
+        group_id = str(event.get_group_id() or "")
+        normalized_message_seq = str(message_seq or "")
+        if not group_id or not normalized_message_seq:
+            return []
+        try:
+            history = await bot.call_action(
+                "get_group_msg_history",
+                group_id=self._as_onebot_id(group_id),
+                message_seq=self._as_onebot_id(normalized_message_seq),
+                count=20,
+                **routing_params,
+            )
+        except Exception:
+            return []
+        for message in self._history_messages(history):
+            if str(message.get("message_id") or "") != str(message_id):
+                continue
+            return self._onebot_image_urls(message)
+        return []
+
     async def failure_detail(
         self,
         event: Any,

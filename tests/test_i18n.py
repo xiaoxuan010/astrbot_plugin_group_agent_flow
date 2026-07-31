@@ -61,6 +61,24 @@ def test_context_window_uses_token_budget_and_cache_retention_settings():
     assert "rotation_retention_ratio" not in items
 
 
+def test_directed_cycle_interval_schema_contract():
+    schema = _load_json(ROOT / "_conf_schema.json")
+    item = schema["scheduling"]["items"][
+        "direct_min_cycle_interval_seconds"
+    ]
+    assert item["type"] == "float"
+    assert item["default"] == 20.0
+
+    for locale in LOCALES:
+        resource = _load_json(
+            ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
+        )
+        localized = resource["config"]["scheduling"][
+            "direct_min_cycle_interval_seconds"
+        ]
+        assert localized["description"]
+
+
 def test_renderer_labels_describe_the_actual_message_structure():
     schema = _load_json(ROOT / "_conf_schema.json")
     renderer = schema["context"]["items"]["renderer"]

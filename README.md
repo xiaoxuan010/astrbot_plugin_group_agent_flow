@@ -8,7 +8,11 @@
 
 消息按群持久化后进入 `WAITING -> DEBOUNCE -> SNAPSHOT -> REASONING -> TOOL ACTION`。
 推理开始时冻结 `snapshot_seq`，推理期间到达的消息进入下一轮，也不会让当前轮重判。
-活跃群通过 `min_cycle_interval_seconds` 限制推理频率。同一 Provider 响应可以包含多个外部动作工具；
+每个群同时计算全局与定向启动资格：全局路径沿用 `debounce_seconds` / `direct_delay_seconds`
+和 `min_cycle_interval_seconds`，定向路径使用 `direct_delay_seconds` 和
+`direct_min_cycle_interval_seconds`（默认 20 秒），两者取较早时间后进入同一个 observation。
+`@机器人`、`@全体`、引用机器人、戳机器人和 AstrBot `wake_prefix` 消息建立定向资格；任何
+observation 实际启动都会刷新该群共享的全局最短周期间隔。同一 Provider 响应可以包含多个外部动作工具；
 当前工具批次完成后，AstrBot Agent Loop 直接结束，不再追加一次模型请求。模型普通 `content`、
 `No Action Needed` 等控制说明和角色扮演文本都属于内部输出，只有显式动作工具可以形成群消息。
 没有动作工具时，本轮保持沉默。
@@ -73,8 +77,9 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 
 纯普通 `content` 会标记为不保存；与工具调用同响应的 `content` 仅作为本轮 Provider
 协议上下文保留，始终不会发送到群内。群消息原始组件、`message_id`、`reply_to`、发送者和
-时间戳存放在插件 JSONL 中，较早内容可通过历史工具按需读取。NapCat 的群戳一戳通知会记录
-发起者和目标 QQ；戳到机器人时，该事件会标记为直接面向机器人。`poke_user` 仅接受冻结快照中已经出现的 QQ 用户。
+时间戳存放在插件 JSONL 中，较早内容可通过历史工具按需读取。引用机器人消息会记录为直接
+面向机器人；NapCat 的群戳一戳通知会记录发起者和目标 QQ，戳到机器人时同样写入定向标记。
+`poke_user` 仅接受冻结快照中已经出现的 QQ 用户。
 
 ## 配置
 
@@ -85,6 +90,11 @@ agent_settings:
   enabled: true
   authorized_group_ids:
     - "1"
+scheduling:
+  debounce_seconds: 10
+  direct_delay_seconds: 1
+  min_cycle_interval_seconds: 120
+  direct_min_cycle_interval_seconds: 20
 ```
 
 授权列表默认留空，因此初次加载只记录配置允许后的消息，不会在任何群自主运行。建议关闭

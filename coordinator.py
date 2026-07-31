@@ -22,7 +22,8 @@ class _FlowState:
     """单个群流水拥有的可变调度状态。"""
 
     pending_seq: int = 0
-    due_at: float | None = None
+    global_due_at: float | None = None
+    direct_due_at: float | None = None
     active_run_id: str | None = None
     last_started_at: float | None = None
     generation: int = 0
@@ -37,11 +38,15 @@ class GroupRunCoordinator:
         debounce_seconds: float = 10,
         direct_delay_seconds: float = 1,
         min_cycle_interval_seconds: float = 10,
+        direct_min_cycle_interval_seconds: float = 20,
     ) -> None:
-        """配置消息聚合延迟和两次推理启动的最小间隔。"""
+        """配置普通/定向消息的聚合延迟和最短启动间隔。"""
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self.direct_delay_seconds = max(0.0, float(direct_delay_seconds))
         self.min_cycle_interval_seconds = max(0.0, float(min_cycle_interval_seconds))
+        self.direct_min_cycle_interval_seconds = max(
+            0.0, float(direct_min_cycle_interval_seconds)
+        )
         self._flows: dict[str, _FlowState] = {}
         self._runs: dict[str, str] = {}
         self._generations: dict[str, int] = {}
@@ -66,11 +71,37 @@ class GroupRunCoordinator:
         state.pending_seq = max(state.pending_seq, int(seq))
         delay = self.direct_delay_seconds if directed else self.debounce_seconds
         candidate_due_at = float(received_at) + delay
-        if state.due_at is None:
-            state.due_at = candidate_due_at
+        if state.global_due_at is None:
+            state.global_due_at = candidate_due_at
         elif directed:
-            # 直接提及机器人时，可以缩短普通消息批次的等待时间。
-            state.due_at = min(state.due_at, candidate_due_at)
+            state.global_due_at = min(state.global_due_at, candidate_due_at)
+        if directed:
+            if state.direct_due_at is None:
+                state.direct_due_at = candidate_due_at
+            else:
+                state.direct_due_at = min(state.direct_due_at, candidate_due_at)
+
+    def _eligible_at(self, state: _FlowState) -> float | None:
+        """返回全局和定向启动路径中最早的可执行时间。"""
+        candidates: list[float] = []
+        if state.global_due_at is not None:
+            global_at = state.global_due_at
+            if state.last_started_at is not None:
+                global_at = max(
+                    global_at,
+                    state.last_started_at + self.min_cycle_interval_seconds,
+                )
+            candidates.append(global_at)
+        if state.direct_due_at is not None:
+            direct_at = state.direct_due_at
+            if state.last_started_at is not None:
+                direct_at = max(
+                    direct_at,
+                    state.last_started_at
+                    + self.direct_min_cycle_interval_seconds,
+                )
+            candidates.append(direct_at)
+        return min(candidates) if candidates else None
 
     def include_pending_seq(self, flow_id: str, seq: int) -> bool:
         """只扩展已有待处理快照，不为内部事实创建新调度。"""
@@ -87,17 +118,11 @@ class GroupRunCoordinator:
             state is None
             or state.active_run_id is not None
             or state.pending_seq <= 0
-            or state.due_at is None
         ):
             return None
 
-        eligible_at = state.due_at
-        if state.last_started_at is not None:
-            eligible_at = max(
-                eligible_at,
-                state.last_started_at + self.min_cycle_interval_seconds,
-            )
-        if now < eligible_at:
+        eligible_at = self._eligible_at(state)
+        if eligible_at is None or now < eligible_at:
             return None
 
         run_id = uuid.uuid4().hex
@@ -110,7 +135,8 @@ class GroupRunCoordinator:
         )
         # 重置后到达的新消息会保留为下一批待处理消息。
         state.pending_seq = 0
-        state.due_at = None
+        state.global_due_at = None
+        state.direct_due_at = None
         state.active_run_id = run_id
         state.last_started_at = float(now)
         self._runs[run_id] = flow_id
@@ -166,11 +192,6 @@ class GroupRunCoordinator:
     def next_due_at(self, flow_id: str) -> float | None:
         """结合聚合延迟和频率限制，返回下一次唤醒时间。"""
         state = self._flows.get(flow_id)
-        if state is None or state.due_at is None:
+        if state is None:
             return None
-        if state.last_started_at is None:
-            return state.due_at
-        return max(
-            state.due_at,
-            state.last_started_at + self.min_cycle_interval_seconds,
-        )
+        return self._eligible_at(state)

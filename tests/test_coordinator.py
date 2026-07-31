@@ -19,6 +19,17 @@ def test_directed_message_uses_short_delay_when_idle():
     assert coordinator.begin_if_due("group:1", now=101.0).snapshot_seq == 10
 
 
+def test_directed_message_advances_mixed_batch_without_splitting_snapshot():
+    coordinator = GroupRunCoordinator(debounce_seconds=10, direct_delay_seconds=1)
+    coordinator.enqueue("group:1", seq=10, received_at=100.0, directed=False)
+    coordinator.enqueue("group:1", seq=11, received_at=105.0, directed=True)
+
+    assert coordinator.next_due_at("group:1") == 106.0
+    snapshot = coordinator.begin_if_due("group:1", now=106.0)
+    assert snapshot.snapshot_seq == 11
+    assert coordinator.next_due_at("group:1") is None
+
+
 def test_messages_arriving_during_run_are_reserved_for_next_snapshot():
     coordinator = GroupRunCoordinator(debounce_seconds=10, direct_delay_seconds=1)
     coordinator.enqueue("group:1", seq=10, received_at=100.0, directed=False)
@@ -47,6 +58,81 @@ def test_minimum_cycle_interval_limits_fast_restarts():
 
     assert coordinator.begin_if_due("group:1", now=109.9) is None
     assert coordinator.begin_if_due("group:1", now=110.0).snapshot_seq == 2
+
+
+def test_directed_path_bypasses_longer_normal_cycle_interval():
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=10,
+        direct_delay_seconds=1,
+        min_cycle_interval_seconds=120,
+        direct_min_cycle_interval_seconds=20,
+    )
+    coordinator.enqueue("group:1", seq=1, received_at=0, directed=False)
+    first = coordinator.begin_if_due("group:1", now=10)
+    coordinator.finish(first.run_id, finished_at=11)
+
+    coordinator.enqueue("group:1", seq=2, received_at=12, directed=True)
+
+    assert coordinator.next_due_at("group:1") == 30
+    assert coordinator.begin_if_due("group:1", now=29.9) is None
+    assert coordinator.begin_if_due("group:1", now=30).snapshot_seq == 2
+
+
+def test_global_path_wins_when_directed_interval_is_longer():
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=10,
+        direct_delay_seconds=1,
+        min_cycle_interval_seconds=10,
+        direct_min_cycle_interval_seconds=100,
+    )
+    coordinator.enqueue("group:1", seq=1, received_at=0, directed=False)
+    first = coordinator.begin_if_due("group:1", now=10)
+    coordinator.finish(first.run_id, finished_at=11)
+
+    coordinator.enqueue("group:1", seq=2, received_at=12, directed=True)
+
+    assert coordinator.next_due_at("group:1") == 20
+    assert coordinator.begin_if_due("group:1", now=19.9) is None
+    assert coordinator.begin_if_due("group:1", now=20).snapshot_seq == 2
+
+
+def test_directed_start_refreshes_global_cycle_interval():
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=10,
+        direct_delay_seconds=1,
+        min_cycle_interval_seconds=120,
+        direct_min_cycle_interval_seconds=20,
+    )
+    coordinator.enqueue("group:1", seq=1, received_at=0, directed=False)
+    first = coordinator.begin_if_due("group:1", now=10)
+    coordinator.finish(first.run_id, finished_at=11)
+    coordinator.enqueue("group:1", seq=2, received_at=12, directed=True)
+    directed = coordinator.begin_if_due("group:1", now=30)
+    coordinator.finish(directed.run_id, finished_at=31)
+
+    coordinator.enqueue("group:1", seq=3, received_at=32, directed=False)
+
+    assert coordinator.next_due_at("group:1") == 150
+    assert coordinator.begin_if_due("group:1", now=149.9) is None
+    assert coordinator.begin_if_due("group:1", now=150).snapshot_seq == 3
+
+
+def test_zero_directed_interval_only_waits_for_direct_delay():
+    coordinator = GroupRunCoordinator(
+        debounce_seconds=10,
+        direct_delay_seconds=1,
+        min_cycle_interval_seconds=120,
+        direct_min_cycle_interval_seconds=0,
+    )
+    coordinator.enqueue("group:1", seq=1, received_at=0, directed=False)
+    first = coordinator.begin_if_due("group:1", now=10)
+    coordinator.finish(first.run_id, finished_at=11)
+
+    coordinator.enqueue("group:1", seq=2, received_at=12, directed=True)
+
+    assert coordinator.next_due_at("group:1") == 13
+    assert coordinator.begin_if_due("group:1", now=12.9) is None
+    assert coordinator.begin_if_due("group:1", now=13).snapshot_seq == 2
 
 
 def test_finish_rejects_unknown_run():

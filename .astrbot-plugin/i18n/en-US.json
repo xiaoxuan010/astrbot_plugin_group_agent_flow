@@ -22,6 +22,9 @@
       "direct_delay_seconds": {
         "description": "Quiet delay for directed messages (seconds)"
       },
+      "direct_min_cycle_interval_seconds": {
+        "description": "Minimum directed-message reasoning cycle interval (seconds)"
+      },
       "min_cycle_interval_seconds": {
         "description": "Minimum reasoning cycle interval (seconds)"
       }

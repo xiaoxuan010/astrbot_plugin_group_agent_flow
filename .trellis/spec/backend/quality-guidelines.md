@@ -91,5 +91,97 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
   metadata or configuration-schema text change.
 - AstrBot core files and unrelated worktree changes remain untouched.
 
+## Scenario: Directed observation scheduling
+
+### 1. Scope / Trigger
+
+Apply this contract when a message class needs a shorter reasoning-cycle interval while still
+entering the normal per-flow observation pipeline. It prevents a fast-path change from delaying
+the existing global candidate or creating a second snapshot lifecycle.
+
+### 2. Signatures
+
+```python
+GroupRunCoordinator(
+    *,
+    debounce_seconds: float = 10,
+    direct_delay_seconds: float = 1,
+    min_cycle_interval_seconds: float = 10,
+    direct_min_cycle_interval_seconds: float = 20,
+)
+
+GroupRunCoordinator.enqueue(
+    flow_id: str,
+    *,
+    seq: int,
+    received_at: float,
+    directed: bool,
+) -> None
+```
+
+Runtime configuration uses `scheduling.direct_min_cycle_interval_seconds`; `main.py` must keep
+`CONFIG_PATHS`, `CONFIG_DEFAULTS`, and `_build_coordinator()` aligned with `_conf_schema.json`.
+
+### 3. Contracts
+
+- `_FlowState.global_due_at` preserves the original deadline behavior: the first message chooses
+  `debounce_seconds` or `direct_delay_seconds`, later ordinary messages keep the deadline, and a
+  later directed message may shorten it.
+- `_FlowState.direct_due_at` exists only after a directed message and uses
+  `received_at + direct_delay_seconds`.
+- Global eligibility applies `min_cycle_interval_seconds`; directed eligibility applies
+  `direct_min_cycle_interval_seconds`; the coordinator returns the earlier existing candidate.
+- Both candidates own one `pending_seq` and allocate exactly one `RunSnapshot`.
+- Every actual start writes the same per-flow `last_started_at` and clears both deadlines.
+- `RunSnapshot` and the downstream observation/Provider/tool/cursor contracts contain no
+  trigger-type branch.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+|---|---|
+| Interval value below 0 | Clamp to `0.0` in `GroupRunCoordinator.__init__` |
+| No prior observation start | Eligibility is the corresponding aggregation deadline |
+| Pending batch has no directed message | `direct_due_at` remains `None`; use global candidate |
+| Directed interval is longer than global interval | Preserve the earlier global candidate |
+| A run is active | Keep the pending batch; `begin_if_due()` returns `None` |
+| `clear_flow(flow_id)` | Remove both deadlines, pending state, active run, and frequency state |
+
+### 5. Good / Base / Bad Cases
+
+- Good: global interval `120`, directed interval `20`; a directed message creates an earlier
+  eligibility candidate and the resulting snapshot includes all pending sequence records.
+- Base: an ordinary-only batch follows the original debounce and global interval behavior.
+- Bad configuration order: global interval `10`, directed interval `100`; the global candidate
+  wins, so adding a directed message never delays the existing observation opportunity.
+
+### 6. Tests Required
+
+- `tests/test_coordinator.py`: assert both interval orderings, mixed-batch `snapshot_seq`, shared
+  `last_started_at` refresh, active-run reservation, zero interval, and `clear_flow()` reset.
+- `tests/test_event_codec.py`: assert bot Reply / other Reply / missing sender plus At and Poke
+  classification.
+- `tests/test_main_observation.py`: assert default, nested, and flat config reads and AstrBot wake
+  flag propagation into `enqueue(..., directed=True)`.
+- `tests/test_i18n.py`: assert schema type `float`, default `20.0`, and both locale descriptions.
+
+### 7. Wrong vs Correct
+
+Wrong — replacing the existing candidate can delay behavior when the new interval is longer:
+
+```python
+interval = direct_interval if pending_directed else global_interval
+eligible_at = max(due_at, last_started_at + interval)
+```
+
+Correct — preserve the existing candidate and add one directed candidate:
+
+```python
+candidates = [global_eligible_at]
+if direct_eligible_at is not None:
+    candidates.append(direct_eligible_at)
+eligible_at = min(candidates)
+```
+
 Avoid introducing a second scheduling path, direct `event.send()` outside `QQActionGateway`,
 string-built persistence formats, unbounded history scans, or untested renderer changes.

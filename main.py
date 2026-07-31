@@ -73,6 +73,10 @@ CONFIG_PATHS = {
     "authorized_group_ids": ("agent_settings", "authorized_group_ids"),
     "debounce_seconds": ("scheduling", "debounce_seconds"),
     "direct_delay_seconds": ("scheduling", "direct_delay_seconds"),
+    "direct_min_cycle_interval_seconds": (
+        "scheduling",
+        "direct_min_cycle_interval_seconds",
+    ),
     "min_cycle_interval_seconds": ("scheduling", "min_cycle_interval_seconds"),
     "context_renderer": ("context", "renderer"),
     "max_context_tokens": ("context", "max_context_tokens"),
@@ -89,6 +93,7 @@ CONFIG_DEFAULTS = {
     "authorized_group_ids": [],
     "debounce_seconds": 10.0,
     "direct_delay_seconds": 1.0,
+    "direct_min_cycle_interval_seconds": 20.0,
     "min_cycle_interval_seconds": 10.0,
     "context_renderer": "legacy_delta",
     "max_context_tokens": 8192,
@@ -156,6 +161,9 @@ class GroupAgentFlowPlugin(Star):
         return GroupRunCoordinator(
             debounce_seconds=float(self._cfg("debounce_seconds", 10) or 0),
             direct_delay_seconds=float(self._cfg("direct_delay_seconds", 1) or 0),
+            direct_min_cycle_interval_seconds=float(
+                self._cfg("direct_min_cycle_interval_seconds", 20) or 0
+            ),
             min_cycle_interval_seconds=float(
                 self._cfg("min_cycle_interval_seconds", 10) or 0
             ),

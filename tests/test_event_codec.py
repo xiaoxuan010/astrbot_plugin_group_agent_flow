@@ -67,6 +67,34 @@ def test_extract_group_event_preserves_routing_and_reply_metadata():
 
 
 @pytest.mark.parametrize(
+    ("reply_sender_id", "expected"),
+    [("7", True), ("10002", False), (0, False)],
+)
+def test_reply_is_directed_only_when_it_quotes_the_bot(
+    reply_sender_id, expected
+):
+    event = FakeEvent()
+    event._messages = [
+        Comp.Reply(id="msg-199", sender_id=reply_sender_id),
+        Comp.Plain("正文"),
+    ]
+
+    record = extract_group_event(event, max_text_chars=4000)
+
+    assert record["is_directed_at_bot"] is expected
+
+
+@pytest.mark.parametrize("target_id", ["7", "all"])
+def test_at_bot_or_all_is_directed(target_id):
+    event = FakeEvent()
+    event._messages = [Comp.At(qq=target_id), Comp.Plain("正文")]
+
+    record = extract_group_event(event, max_text_chars=4000)
+
+    assert record["is_directed_at_bot"] is True
+
+
+@pytest.mark.parametrize(
     (
         "action_name",
         "action_result",

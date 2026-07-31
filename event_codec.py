@@ -198,8 +198,14 @@ def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, 
         "",
     )
     directed = any(
-        isinstance(component, Comp.At)
-        and _value(component.qq) in {self_id, "all"}
+        (
+            isinstance(component, Comp.At)
+            and _value(component.qq) in {self_id, "all"}
+        )
+        or (
+            isinstance(component, Comp.Reply)
+            and _value(component.sender_id) == self_id
+        )
         for component in components
     )
     poke_targets = [

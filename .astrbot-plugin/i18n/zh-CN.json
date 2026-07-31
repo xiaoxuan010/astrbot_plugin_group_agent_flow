@@ -22,6 +22,9 @@
       "direct_delay_seconds": {
         "description": "定向消息等待时间（秒）"
       },
+      "direct_min_cycle_interval_seconds": {
+        "description": "定向消息最短推理周期间隔（秒）"
+      },
       "min_cycle_interval_seconds": {
         "description": "最短推理周期间隔（秒）"
       }

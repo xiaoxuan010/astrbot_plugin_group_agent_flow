@@ -85,6 +85,23 @@ def test_system_prompt_requires_tools_without_duplicating_tool_names():
     assert "snapshot" not in prompt.lower()
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, 20.0),
+        ({"scheduling": {"direct_min_cycle_interval_seconds": 7}}, 7.0),
+        ({"direct_min_cycle_interval_seconds": 9}, 9.0),
+    ],
+)
+def test_build_coordinator_reads_direct_min_cycle_interval(config, expected):
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.config = config
+
+    coordinator = plugin._build_coordinator()
+
+    assert coordinator.direct_min_cycle_interval_seconds == expected
+
+
 @pytest.mark.asyncio
 async def test_record_schedules_message_while_holding_the_flow_lock(monkeypatch):
     flow_id = "qq:group:1"
@@ -125,6 +142,41 @@ async def test_record_schedules_message_while_holding_the_flow_lock(monkeypatch)
 
     assert recorded == (flow_id, 7, False)
     assert enqueue_calls == [(flow_id, 7, False, True)]
+
+
+@pytest.mark.asyncio
+async def test_record_treats_astrbot_wake_flag_as_directed(monkeypatch):
+    flow_id = "qq:group:1"
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.config = {}
+    plugin._locks = {}
+    plugin.store = SimpleNamespace(append_record=lambda _flow_id, _record: 7)
+    enqueue_calls = []
+
+    class Coordinator:
+        def enqueue(self, actual_flow_id, *, seq, received_at, directed):
+            enqueue_calls.append((actual_flow_id, seq, directed))
+
+    plugin.coordinator = Coordinator()
+    monkeypatch.setattr(
+        main_module,
+        "extract_group_event",
+        lambda _event, **_kwargs: {
+            "flow_id": flow_id,
+            "text": "wake message",
+            "components": [],
+            "is_directed_at_bot": False,
+        },
+    )
+    event = FakeEvent({})
+    event.get_sender_id = lambda: "user-1"
+    event.get_self_id = lambda: "bot-1"
+    event.is_at_or_wake_command = True
+
+    recorded = await plugin._record(event, schedule=True)
+
+    assert recorded == (flow_id, 7, True)
+    assert enqueue_calls == [(flow_id, 7, True)]
 
 
 @pytest.mark.asyncio

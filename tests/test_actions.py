@@ -80,6 +80,78 @@ async def test_reply_message_builds_reply_mentions_and_text_chain():
 
 
 @pytest.mark.asyncio
+async def test_refresh_message_images_uses_fresh_url_from_exact_message():
+    event = FakeEvent()
+
+    async def call_action(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        assert action == "get_msg"
+        return {
+            "message_id": 12345,
+            "message": [
+                {
+                    "type": "image",
+                    "data": {"url": "https://cdn.example.com/fresh.jpg"},
+                }
+            ],
+        }
+
+    event.bot.call_action = call_action
+
+    refs = await QQActionGateway().refresh_message_images(
+        event,
+        message_id="12345",
+        message_seq="77",
+    )
+
+    assert refs == ["https://cdn.example.com/fresh.jpg"]
+    assert event.bot.actions == [
+        ("get_msg", {"message_id": 12345, "self_id": 7})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_message_images_uses_group_history_when_exact_lookup_fails():
+    event = FakeEvent()
+
+    async def call_action(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        if action == "get_msg":
+            raise RuntimeError("message expired")
+        assert action == "get_group_msg_history"
+        return {
+            "messages": [
+                {
+                    "message_id": "12345",
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {"url": "https://cdn.example.com/history.jpg"},
+                        }
+                    ],
+                }
+            ]
+        }
+
+    event.bot.call_action = call_action
+
+    refs = await QQActionGateway().refresh_message_images(
+        event,
+        message_id="12345",
+        message_seq="77",
+    )
+
+    assert refs == ["https://cdn.example.com/history.jpg"]
+    assert event.bot.actions == [
+        ("get_msg", {"message_id": 12345, "self_id": 7}),
+        (
+            "get_group_msg_history",
+            {"group_id": 1, "message_seq": 77, "count": 20, "self_id": 7},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reaction", "emoji_id"),
     [

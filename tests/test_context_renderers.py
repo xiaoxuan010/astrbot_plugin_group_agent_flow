@@ -89,7 +89,11 @@ XML_EVENTS = [
             {"type": "at", "user_id": "all", "name": ""},
             {"type": "at", "user_id": "10002", "name": "Bob"},
             {"type": "text", "text": "正文 <tag>&"},
-            {"type": "image", "url": "https://example.com/a.jpg"},
+            {
+                "type": "image",
+                "url": "https://example.com/a.jpg",
+                "source_url": "https://signed.example.com/private/a.jpg",
+            },
             {"type": "face", "id": "123"},
             {"type": "poke", "target_id": "10002"},
             {"type": "voice", "url": "https://example.com/a.mp3"},
@@ -131,6 +135,7 @@ def test_xml_delta_aggregates_structured_components_into_one_user_block():
     assert '<mention user_id="10002" name="Bob"/>' in content
     assert '<text>正文 &lt;tag&gt;&amp;</text>' in content
     assert '<image url="https://example.com/a.jpg"/>' in content
+    assert "signed.example.com" not in content
     assert '<face id="123"/>' in content
     assert '<poke target_id="10002"/>' in content
     assert '<voice url="https://example.com/a.mp3"/>' in content

@@ -55,6 +55,31 @@ def _component_record(component: Any) -> dict[str, Any]:
     return {"type": _value(component_type or component.__class__.__name__).lower()}
 
 
+def _field(value: Any, name: str) -> Any:
+    """兼容读取原始适配器事件中的字典与对象字段。"""
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _raw_image_source_urls(event: Any) -> list[str]:
+    """按原始 OneBot 图片段顺序提取可延后下载的线上 URL。"""
+    raw_event = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    segments = _field(raw_event, "message")
+    if not isinstance(segments, (list, tuple)):
+        return []
+
+    source_urls = []
+    for segment in segments:
+        if _value(_field(segment, "type")).lower() != "image":
+            continue
+        url = _value(_field(_field(segment, "data"), "url")).strip()
+        source_urls.append(
+            url if url.startswith(("https://", "http://")) else ""
+        )
+    return source_urls
+
+
 def _mention_records(mentions: Any) -> tuple[list[str], list[dict[str, Any]]]:
     """规范化动作回执中的提及列表。"""
     if not isinstance(mentions, list):
@@ -156,6 +181,17 @@ def build_agent_action_record(
 def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, Any]:
     """从群事件提取路由、发送者、文本和消息组件。"""
     components = list(event.get_messages())
+    raw_event = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    message_seq = _value(_field(raw_event, "message_seq"))
+    raw_image_urls = iter(_raw_image_source_urls(event))
+    component_records = []
+    for component in components:
+        component_record = _component_record(component)
+        if isinstance(component, Comp.Image):
+            source_url = next(raw_image_urls, "")
+            if source_url:
+                component_record["source_url"] = source_url
+        component_records.append(component_record)
     self_id = _value(event.get_self_id())
     reply_to = next(
         (_value(component.id) for component in components if isinstance(component, Comp.Reply)),
@@ -191,7 +227,7 @@ def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, 
     platform_id = _value(event.get_platform_id())
     group_id = _value(event.get_group_id())
 
-    return {
+    record = {
         "schema_version": 2,
         "record_kind": "group_message",
         "seq": 0,
@@ -206,7 +242,10 @@ def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, 
         "self_id": self_id,
         "timestamp": timestamp,
         "text": text,
-        "components": [_component_record(component) for component in components],
+        "components": component_records,
         "reply_to": reply_to or None,
         "is_directed_at_bot": directed,
     }
+    if message_seq:
+        record["message_seq"] = message_seq
+    return record

@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from astrbot.api.provider import ProviderRequest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
@@ -136,7 +137,10 @@ async def test_observation_request_uses_a_short_tool_call_reminder():
         min_cycle_interval_seconds=0,
     )
     plugin._locks = {}
-    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    tool_set_events = []
+    plugin.tool_runtime = SimpleNamespace(
+        build_tool_set=lambda actual_event: tool_set_events.append(actual_event) or "tools"
+    )
 
     async def record(_event, *, schedule):
         assert schedule is True
@@ -173,6 +177,8 @@ async def test_observation_request_uses_a_short_tool_call_reminder():
     )
     assert "snapshot" not in cycle_prompt.lower()
     assert request["prompt"] == cycle_prompt
+    assert request["tool_set"] == "tools"
+    assert tool_set_events == [event]
 
 
 @pytest.mark.asyncio
@@ -446,7 +452,10 @@ async def test_inject_snapshot_bootstraps_when_only_legacy_cursor_covers_snapsho
     plugin.store = store
     plugin.config = {}
     plugin._locks = {}
-    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    tool_set_events = []
+    plugin.tool_runtime = SimpleNamespace(
+        build_tool_set=lambda actual_event: tool_set_events.append(actual_event) or "tools"
+    )
     snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {
@@ -469,8 +478,32 @@ async def test_inject_snapshot_bootstraps_when_only_legacy_cursor_covers_snapsho
     assert len(request.contexts) == 1
     assert "already consumed" in request.contexts[0]["content"]
     assert request.func_tool == "tools"
+    assert tool_set_events == [event]
     assert request.conversation.token_usage == 0
     assert store.get_run_outcome(snapshot.run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_enforce_autonomous_tools_builds_tools_for_current_event(monkeypatch):
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    event = FakeEvent({AUTONOMOUS_EXTRA: True})
+    request = ProviderRequest(prompt="observe")
+    event.set_extra("provider_request", request)
+    tool_set_events = []
+    plugin.tool_runtime = SimpleNamespace(
+        build_tool_set=lambda actual_event: tool_set_events.append(actual_event) or "tools"
+    )
+    enforced = []
+    monkeypatch.setattr(
+        main_module,
+        "enforce_tool_set",
+        lambda actual_request, tool_set: enforced.append((actual_request, tool_set)),
+    )
+
+    await plugin.enforce_autonomous_tools(event, None)
+
+    assert tool_set_events == [event]
+    assert enforced == [(request, "tools")]
 
 
 @pytest.mark.asyncio
@@ -498,7 +531,7 @@ async def test_inject_snapshot_adds_completed_agent_action_to_provider_context(t
     plugin.store = store
     plugin.config = {"context": {"renderer": "plain_lines"}}
     plugin._locks = {}
-    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda _event: "tools")
     snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {
@@ -575,7 +608,7 @@ async def test_inject_snapshot_uses_the_current_renderer_without_replacing_core_
     plugin.store = store
     plugin.config = {"context": {"renderer": "native_messages"}}
     plugin._locks = {}
-    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda _event: "tools")
     snapshot = _activate_run(plugin, flow_id, 2)
     event = FakeEvent(
         {
@@ -630,7 +663,7 @@ async def test_final_prompt_hook_moves_protocol_after_later_astrbot_hooks(tmp_pa
     plugin.store = store
     plugin.config = {}
     plugin._locks = {}
-    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda: "tools")
+    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda _event: "tools")
     snapshot = _activate_run(plugin, flow_id, 1)
     event = FakeEvent(
         {

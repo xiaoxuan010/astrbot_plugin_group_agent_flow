@@ -210,6 +210,39 @@ def test_extract_group_event_serializes_supported_components():
     ]
 
 
+def test_extract_group_event_keeps_raw_remote_image_url_for_later_download():
+    event = FakeEvent()
+    event._messages = [
+        Comp.Image(file=r"D:\\AstrBot\\data\\temp\\expired-first.jpg"),
+        Comp.Image(file=r"D:\\AstrBot\\data\\temp\\expired-second.jpg"),
+    ]
+    event.message_obj.raw_message = {
+        "message_seq": 4321,
+        "message": [
+            {"type": "image", "data": {"file": "first.jpg"}},
+            {
+                "type": "image",
+                "data": {"url": "https://cdn.example.com/second.jpg"},
+            },
+        ]
+    }
+
+    record = extract_group_event(event, max_text_chars=4000)
+
+    assert record["components"] == [
+        {
+            "type": "image",
+            "url": r"D:\\AstrBot\\data\\temp\\expired-first.jpg",
+        },
+        {
+            "type": "image",
+            "url": r"D:\\AstrBot\\data\\temp\\expired-second.jpg",
+            "source_url": "https://cdn.example.com/second.jpg",
+        },
+    ]
+    assert record["message_seq"] == "4321"
+
+
 def test_extract_group_event_bounds_text_without_losing_original_components():
     event = FakeEvent()
     event.get_message_outline = lambda: "abcdef"

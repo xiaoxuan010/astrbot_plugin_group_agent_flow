@@ -8,6 +8,7 @@ AstrBot's event and Agent hook API; local state is stored as JSONL and JSON file
 | [Directory Structure](./directory-structure.md) | Module ownership and dependency direction |
 | [Persistence](./persistence-guidelines.md) | Event logs, state files, migrations, and concurrency |
 | [Error Handling](./error-handling.md) | Tool errors, gateway failures, and protocol fallbacks |
+| [Image Tools](./image-tools.md) | Snapshot image lookup, caption routing, and multimodal visibility |
 | [Logging](./logging-guidelines.md) | AstrBot logger usage and diagnostic boundaries |
 | [Quality](./quality-guidelines.md) | Tests, linting, compatibility, and review checks |
 

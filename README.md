@@ -20,7 +20,19 @@
 - `react_message`
 - `poke_user`
 - `get_message`
+- `get_message_images`
+- `get_image_captions`
 - `search_chat_history`
+
+当前聊天 Provider 的 `provider_config.modalities` 显式包含 `image` 时，工具集只包含
+`get_message_images`，它按 `message_id` 返回冻结快照中的原图。其他 Provider 的工具集只包含
+`get_image_captions`，它使用 AstrBot `provider_settings.default_image_caption_provider_id`
+指定的视觉 Provider 返回图片转述，供文本模型以较低的上下文 token 消耗理解图片。
+图片事件会保存 OneBot 原始段中的线上 `data.url`，两个工具调用时优先按需下载该地址；上下文
+渲染继续使用原有图片引用，不会把线上地址传给聊天模型。线上地址失效时，原图工具返回
+`image_unavailable`。原图工具会先调用 NapCat `get_msg` 刷新当前消息的图片地址；新事件保存
+`message_seq` 后，`get_group_msg_history` 还能作为刷新兜底。未配置转述 Provider 时，工具返回
+`image_caption_provider_unconfigured`。
 
 发送闸门拦截普通 LLM `content`、推理、Provider 错误和内部工具状态。工具动作通过保存的原始
 发送入口直接调用

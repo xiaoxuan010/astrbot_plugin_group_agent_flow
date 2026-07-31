@@ -132,6 +132,7 @@ class GroupAgentFlowPlugin(Star):
             terminal_callback=self._finalize_terminal_observation,
             action_persist_callback=self._persist_agent_action,
             action_admission_callback=self._admit_external_action,
+            context=self.context,
         )
 
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -334,7 +335,7 @@ class GroupAgentFlowPlugin(Star):
                 # yield 后由 AstrBot 原生 Agent/工具循环接管执行。
                 yield event.request_llm(
                     prompt=OBSERVATION_CYCLE_PROMPT,
-                    tool_set=self.tool_runtime.build_tool_set(),
+                    tool_set=self.tool_runtime.build_tool_set(event),
                     conversation=conversation,
                     system_prompt=self._system_prompt(),
                 )
@@ -421,7 +422,7 @@ class GroupAgentFlowPlugin(Star):
             event.stop_event()
             return
         req.contexts = [*req.contexts, *prepared.contexts]
-        req.func_tool = self.tool_runtime.build_tool_set()
+        req.func_tool = self.tool_runtime.build_tool_set(event)
         if bool(self._cfg("debug_log", False)):
             logger.debug(
                 f"[{PLUGIN_NAME}] prepared snapshot {event.get_extra(PENDING_CURSOR_EXTRA)}"
@@ -513,7 +514,7 @@ class GroupAgentFlowPlugin(Star):
             return
         request = event.get_extra("provider_request")
         if isinstance(request, ProviderRequest):
-            enforce_tool_set(request, self.tool_runtime.build_tool_set())
+            enforce_tool_set(request, self.tool_runtime.build_tool_set(event))
 
     @filter.on_agent_done(priority=-maxsize + 20)
     async def remove_direct_output_from_history(

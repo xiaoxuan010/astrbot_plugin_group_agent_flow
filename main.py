@@ -12,6 +12,10 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.astr_main_agent_resources import (
+    TOOL_CALL_PROMPT,
+    TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
+)
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -59,8 +63,15 @@ Review the recent group chat and complete this cycle through the appropriate too
 
 
 def _place_agent_protocol_last(system_prompt: str | None) -> str:
-    """将固定动作协议去重并放到最终 System Prompt 末尾。"""
-    preceding = str(system_prompt or "").replace(AGENT_PROTOCOL_PROMPT, "").strip()
+    """移除 Core 工具提示，并将固定动作协议去重后放到末尾。"""
+    preceding = str(system_prompt or "")
+    for prompt in (
+        AGENT_PROTOCOL_PROMPT,
+        TOOL_CALL_PROMPT,
+        TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
+    ):
+        preceding = preceding.replace(prompt, "")
+    preceding = preceding.strip()
     return (
         f"{preceding}\n\n{AGENT_PROTOCOL_PROMPT}"
         if preceding

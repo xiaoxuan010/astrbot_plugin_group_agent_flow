@@ -5,6 +5,10 @@ import sys
 import pytest
 
 from astrbot.api.provider import ProviderRequest
+from astrbot.core.astr_main_agent_resources import (
+    TOOL_CALL_PROMPT,
+    TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
@@ -746,3 +750,36 @@ async def test_final_prompt_hook_moves_protocol_after_later_astrbot_hooks(tmp_pa
     assert "# Persona Instructions\nAct like Paimon." in request.system_prompt
     assert "# Tool Instructions\nCall tools when useful." in request.system_prompt
     assert request.func_tool == "tools"
+
+
+@pytest.mark.asyncio
+async def test_finalize_agent_protocol_removes_core_tool_prompts_for_autonomous_request():
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    event = FakeEvent({AUTONOMOUS_EXTRA: True})
+    request = SimpleNamespace(
+        system_prompt=(
+            f"# Persona Instructions\nAct like Paimon.\n\n{TOOL_CALL_PROMPT}\n\n"
+            f"{TOOL_CALL_PROMPT_SKILLS_LIKE_MODE}\n\n"
+            f"{main_module.AGENT_PROTOCOL_PROMPT}"
+        )
+    )
+
+    await plugin.finalize_agent_protocol(event, request)
+
+    assert TOOL_CALL_PROMPT not in request.system_prompt
+    assert TOOL_CALL_PROMPT_SKILLS_LIKE_MODE not in request.system_prompt
+    assert request.system_prompt.endswith(main_module.AGENT_PROTOCOL_PROMPT)
+    assert request.system_prompt.count(main_module.AGENT_PROTOCOL_PROMPT) == 1
+    assert "# Persona Instructions\nAct like Paimon." in request.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_finalize_agent_protocol_leaves_non_autonomous_request_unchanged():
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    event = FakeEvent({AUTONOMOUS_EXTRA: False})
+    original_prompt = f"# Tool Instructions\n{TOOL_CALL_PROMPT}"
+    request = SimpleNamespace(system_prompt=original_prompt)
+
+    await plugin.finalize_agent_protocol(event, request)
+
+    assert request.system_prompt == original_prompt

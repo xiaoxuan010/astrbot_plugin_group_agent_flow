@@ -53,8 +53,11 @@ Different Providers use that field for role-play replies or control statements s
 - `_system_prompt()` creates the plugin-owned prompt with optional custom text before
   `AGENT_PROTOCOL_PROMPT`.
 - AstrBot and other request hooks may append conversation persona, safety, context, and tool
-  instructions. The lowest-priority `finalize_agent_protocol()` hook removes duplicate fixed
-  protocols and places the protocol at the end of `req.system_prompt` before Provider execution.
+  instructions. For a request marked with `AUTONOMOUS_EXTRA`, the lowest-priority
+  `finalize_agent_protocol()` hook removes duplicate fixed protocols plus Core's
+  `TOOL_CALL_PROMPT` and `TOOL_CALL_PROMPT_SKILLS_LIKE_MODE`, then places the protocol at the end
+  of `req.system_prompt` before Provider execution. It must not alter non-autonomous requests or
+  the Core constants.
 - Explicit action tools call `tool_send()` through `QQActionGateway` and record the actual
   action name with `succeeded` or `failed` status.
 - A successful gateway result is encoded and persisted as `agent_action` before its structured
@@ -121,8 +124,9 @@ Different Providers use that field for role-play replies or control statements s
 ### 6. Tests Required
 
 - Prompt contract tests assert generic mandatory tool wording, absence of concrete tool names,
-  fixed-protocol ordering after custom persona text and AstrBot-added instructions, one protocol
-  copy in the final request, and runtime use of the cycle prompt.
+  fixed-protocol ordering after custom persona text and AstrBot-added instructions, removal of
+  both Core tool-call prompts only for autonomous requests, one protocol copy in the final request,
+  and runtime use of the cycle prompt.
 - Policy test asserts ordinary LLM content creates zero original-sender calls.
 - Tool boundary test asserts only `B` reaches the original sender for content `A` plus tool `B`.
 - Isolation tests assert reasoning and general results create zero sends.

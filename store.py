@@ -1,134 +1,551 @@
-"""群聊上下文流水的本地持久化存储。"""
+"""SQLite-backed pending buffer for autonomous group observations."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
+import secrets
+import sqlite3
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
+SCHEMA_VERSION = 1
+_PENDING = "pending"
+_INFLIGHT = "inflight"
+_ACKED = "acked"
+_REQUEUED = "requeued"
+
+
+class StoreInitializationError(RuntimeError):
+    """The plugin database cannot be initialized or is not supported."""
+
+
+class BufferCapacityError(RuntimeError):
+    """The configured pending buffer limit would be exceeded."""
+
+
+class ActiveBatchError(RuntimeError):
+    """A flow already has an unconfirmed batch."""
+
+
+@dataclass(frozen=True, slots=True)
+class AppendResult:
+    """Result of inserting one pending event."""
+
+    seq: int
+    inserted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BatchSnapshot:
+    """Immutable rows claimed for one autonomous Agent run."""
+
+    batch_id: str
+    flow_id: str
+    snapshot_seq: int
+    checkpoint_id: str
+    checkpoint_baseline_count: int
+    records: tuple[dict[str, Any], ...]
+
+
 class GroupFlowStore:
-    """无需数据库，按群持久化事件日志和共享运行元数据。"""
+    """Own the plugin's short-lived pending/inflight SQLite buffer."""
 
-    def __init__(self, base_dir: Path, max_log_records: int = 5000) -> None:
-        """创建存储目录，并配置每条群流水的日志保留上限。"""
-        self.base_dir = base_dir
-        self.logs_dir = base_dir / "logs"
-        self.state_path = base_dir / "state.json"
-        self.migration_path = base_dir / "legacy_migration.json"
+    def __init__(self, base_dir: Path, max_log_records: int = 0) -> None:
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.base_dir / "group_agent_flow.db"
         self.max_log_records = max(0, int(max_log_records or 0))
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._initialize()
 
-    def _flow_hash(self, flow_id: str) -> str:
-        """将平台流水标识映射为文件系统安全的稳定键。"""
-        return hashlib.sha256(flow_id.encode("utf-8")).hexdigest()[:32]
-
-    def _log_path(self, flow_id: str) -> Path:
-        """返回分配给指定群流水的 JSONL 路径。"""
-        return self.logs_dir / f"{self._flow_hash(flow_id)}.jsonl"
-
-    def _cursor_key(self, flow_id: str, conversation_id: str) -> str:
-        """将 cursor 和 renderer 分配限定在单个会话内。"""
-        return f"{self._flow_hash(flow_id)}:{conversation_id}"
-
-    def _read_json_file(self, path: Path, default: Any) -> Any:
-        """读取 JSON；文件缺失或损坏时返回安全默认值。"""
-        if not path.is_file():
-            return default
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.db_path,
+            timeout=5.0,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
         try:
-            with path.open("r", encoding="utf-8") as file:
-                return json.load(file)
-        except (OSError, json.JSONDecodeError):
-            return default
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            connection.close()
+            raise
+        return connection
 
-    def _write_json_file(self, path: Path, payload: Any) -> None:
-        """通过同目录临时文件原子替换 JSON 文件。"""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp_path, path)
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
 
-    def read_records(self, flow_id: str) -> list[dict[str, Any]]:
-        """读取有效对象记录，并跳过损坏的 JSONL 行。"""
-        path = self._log_path(flow_id)
-        if not path.is_file():
-            return []
-        records: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict):
-                    records.append(item)
-        return records
+    def _initialize(self) -> None:
+        try:
+            with self._connection() as connection:
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version == 0:
+                    connection.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS flows (
+                            flow_id TEXT PRIMARY KEY,
+                            next_seq INTEGER NOT NULL DEFAULT 1,
+                            updated_at INTEGER NOT NULL
+                        );
 
-    def write_records(self, flow_id: str, records: list[dict[str, Any]]) -> None:
-        """原子重写指定流水保留的 JSONL 记录。"""
-        path = self._log_path(flow_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as file:
-            for record in records:
-                file.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
-                file.write("\n")
-        os.replace(tmp_path, path)
+                        CREATE TABLE IF NOT EXISTS buffer_batches (
+                            batch_id TEXT PRIMARY KEY,
+                            flow_id TEXT NOT NULL,
+                            snapshot_seq INTEGER NOT NULL,
+                            checkpoint_id TEXT NOT NULL,
+                            checkpoint_baseline_count INTEGER NOT NULL DEFAULT 0,
+                            state TEXT NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            finished_at INTEGER,
+                            FOREIGN KEY(flow_id) REFERENCES flows(flow_id)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_batches_flow_state
+                            ON buffer_batches(flow_id, state);
+
+                        CREATE TABLE IF NOT EXISTS buffer_messages (
+                            flow_id TEXT NOT NULL,
+                            seq INTEGER NOT NULL,
+                            message_id TEXT,
+                            status TEXT NOT NULL,
+                            batch_id TEXT,
+                            payload_json TEXT NOT NULL,
+                            timestamp INTEGER NOT NULL DEFAULT 0,
+                            sender_id TEXT NOT NULL DEFAULT '',
+                            PRIMARY KEY(flow_id, seq),
+                            FOREIGN KEY(flow_id) REFERENCES flows(flow_id)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_messages_flow_status_seq
+                            ON buffer_messages(flow_id, status, seq);
+                        CREATE INDEX IF NOT EXISTS idx_messages_flow_batch_seq
+                            ON buffer_messages(flow_id, batch_id, seq);
+
+                        CREATE TABLE IF NOT EXISTS message_keys (
+                            flow_id TEXT NOT NULL,
+                            message_id TEXT NOT NULL,
+                            seq INTEGER NOT NULL,
+                            first_seen_at INTEGER NOT NULL,
+                            PRIMARY KEY(flow_id, message_id),
+                            FOREIGN KEY(flow_id) REFERENCES flows(flow_id)
+                        );
+
+                        PRAGMA user_version=1;
+                        """
+                    )
+                elif version != SCHEMA_VERSION:
+                    raise StoreInitializationError(
+                        f"unsupported group flow database schema: {version}"
+                    )
+                connection.execute(
+                    """
+                    DELETE FROM buffer_batches
+                    WHERE state IN (?, ?) AND finished_at IS NOT NULL AND finished_at < ?
+                    """,
+                    (_ACKED, _REQUEUED, self._now() - 7 * 24 * 60 * 60),
+                )
+        except StoreInitializationError:
+            raise
+        except (OSError, sqlite3.DatabaseError) as exc:
+            raise StoreInitializationError(
+                f"failed to initialize group flow database: {type(exc).__name__}"
+            ) from exc
+
+    @staticmethod
+    def _now() -> int:
+        return int(time.time())
+
+    @staticmethod
+    def _flow_hash(flow_id: str) -> str:
+        return hashlib.sha256(str(flow_id).encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _decode_payload(row: sqlite3.Row) -> dict[str, Any]:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise StoreInitializationError("buffer payload is not an object")
+        result = dict(payload)
+        result["seq"] = int(row["seq"])
+        return result
+
+    def _ensure_flow(self, connection: sqlite3.Connection, flow_id: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO flows(flow_id, next_seq, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(flow_id) DO NOTHING
+            """,
+            (str(flow_id), self._now()),
+        )
+
+    def _active_count(self, connection: sqlite3.Connection, flow_id: str) -> int:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM buffer_messages WHERE flow_id=?",
+            (str(flow_id),),
+        ).fetchone()
+        return int(row[0])
+
+    def append_pending(self, flow_id: str, record: dict[str, Any]) -> AppendResult:
+        """Insert one group message into pending, deduplicating platform IDs."""
+        flow_id = str(flow_id)
+        if not isinstance(record, dict):
+            raise TypeError("buffer record must be a mapping")
+        record_kind = str(record.get("record_kind") or "group_message")
+        if record_kind != "group_message":
+            raise ValueError(
+                f"SQLite Buffer accepts only group_message records, got {record_kind}"
+            )
+        message_id = str(record.get("message_id") or "")
+        payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        timestamp = int(record.get("timestamp") or 0)
+        sender_id = str(record.get("sender_id") or "")
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_flow(connection, flow_id)
+                if message_id:
+                    existing = connection.execute(
+                        "SELECT seq FROM message_keys WHERE flow_id=? AND message_id=?",
+                        (flow_id, message_id),
+                    ).fetchone()
+                    if existing is not None:
+                        connection.commit()
+                        return AppendResult(seq=int(existing[0]), inserted=False)
+
+                if (
+                    self.max_log_records > 0
+                    and self._active_count(connection, flow_id)
+                    >= self.max_log_records
+                ):
+                    raise BufferCapacityError(
+                        f"group flow buffer is full: flow_id={flow_id} "
+                        f"limit={self.max_log_records}"
+                    )
+
+                row = connection.execute(
+                    "SELECT next_seq FROM flows WHERE flow_id=?",
+                    (flow_id,),
+                ).fetchone()
+                seq = int(row[0])
+                connection.execute(
+                    "UPDATE flows SET next_seq=?, updated_at=? WHERE flow_id=?",
+                    (seq + 1, self._now(), flow_id),
+                )
+                if message_id:
+                    connection.execute(
+                        """
+                        INSERT INTO message_keys(flow_id, message_id, seq, first_seen_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (flow_id, message_id, seq, self._now()),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO buffer_messages(
+                        flow_id, seq, message_id, status, batch_id,
+                        payload_json, timestamp, sender_id
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+                    """,
+                    (
+                        flow_id,
+                        seq,
+                        message_id or None,
+                        _PENDING,
+                        payload,
+                        timestamp,
+                        sender_id,
+                    ),
+                )
+                connection.commit()
+                return AppendResult(seq=seq, inserted=True)
+            except Exception:
+                connection.rollback()
+                raise
 
     def append_record(self, flow_id: str, record: dict[str, Any]) -> int:
-        """按消息 ID 去重、分配序号并执行保留上限。"""
-        records = self.read_records(flow_id)
-        message_id = str(record.get("message_id") or "")
-        if message_id:
-            for existing in records:
-                if str(existing.get("message_id") or "") == message_id:
-                    return int(existing.get("seq") or 0)
+        """Compatibility wrapper for callers still using the old method name."""
+        return self.append_pending(flow_id, record).seq
 
-        last_seq = max((int(item.get("seq") or 0) for item in records), default=0)
-        seq = last_seq + 1
-        record["seq"] = seq
-        records.append(record)
+    def claim_batch(
+        self,
+        flow_id: str,
+        snapshot_seq: int,
+        *,
+        checkpoint_id: str | None = None,
+        checkpoint_baseline_count: int = 0,
+    ) -> BatchSnapshot | None:
+        """Atomically move pending rows up to the requested boundary to inflight."""
+        flow_id = str(flow_id)
+        requested_seq = int(snapshot_seq)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_flow(connection, flow_id)
+                active = connection.execute(
+                    """
+                    SELECT batch_id FROM buffer_batches
+                    WHERE flow_id=? AND state=?
+                    LIMIT 1
+                    """,
+                    (flow_id, _INFLIGHT),
+                ).fetchone()
+                if active is not None:
+                    raise ActiveBatchError(
+                        f"flow already has active batch: {active['batch_id']}"
+                    )
+                rows = connection.execute(
+                    """
+                    SELECT * FROM buffer_messages
+                    WHERE flow_id=? AND status=? AND seq<=?
+                    ORDER BY seq
+                    """,
+                    (flow_id, _PENDING, requested_seq),
+                ).fetchall()
+                if not rows:
+                    connection.commit()
+                    return None
 
-        if self.max_log_records > 0 and len(records) > self.max_log_records:
-            records = records[-self.max_log_records :]
+                last_seq = int(rows[-1]["seq"])
+                batch_id = f"gaf-batch:{self._flow_hash(flow_id)}:{secrets.token_hex(8)}"
+                expected_checkpoint = checkpoint_id or f"gaf:{batch_id}"
+                baseline = max(0, int(checkpoint_baseline_count or 0))
+                now = self._now()
+                connection.execute(
+                    """
+                    INSERT INTO buffer_batches(
+                        batch_id, flow_id, snapshot_seq, checkpoint_id,
+                        checkpoint_baseline_count, state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        flow_id,
+                        last_seq,
+                        expected_checkpoint,
+                        baseline,
+                        _INFLIGHT,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE buffer_messages
+                    SET status=?, batch_id=?
+                    WHERE flow_id=? AND status=? AND seq<=?
+                    """,
+                    (_INFLIGHT, batch_id, flow_id, _PENDING, last_seq),
+                )
+                connection.commit()
+                records = tuple(self._decode_payload(row) for row in rows)
+                return BatchSnapshot(
+                    batch_id=batch_id,
+                    flow_id=flow_id,
+                    snapshot_seq=last_seq,
+                    checkpoint_id=expected_checkpoint,
+                    checkpoint_baseline_count=baseline,
+                    records=records,
+                )
+            except Exception:
+                connection.rollback()
+                raise
 
-        self.write_records(flow_id, records)
-        return seq
+    def get_batch_records(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM buffer_messages
+                WHERE batch_id=? AND status=?
+                ORDER BY seq
+                """,
+                (str(batch_id), _INFLIGHT),
+            ).fetchall()
+        return [self._decode_payload(row) for row in rows]
 
-    def find_seq_by_message_id(self, flow_id: str, message_id: str) -> int | None:
-        """查找平台消息 ID 对应的持久化序号。"""
-        if not message_id:
+    def get_active_batch(self, flow_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM buffer_batches
+                WHERE flow_id=? AND state=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(flow_id), _INFLIGHT),
+            ).fetchone()
+        if row is None:
             return None
-        for record in self.read_records(flow_id):
-            if str(record.get("message_id") or "") == message_id:
-                return int(record.get("seq") or 0)
-        return None
+        return dict(row)
 
-    def get_range(self, flow_id: str, start_seq: int, end_seq: int) -> list[dict[str, Any]]:
-        """按持久化顺序返回包含首尾的序号区间。"""
-        if end_seq < start_seq:
-            return []
-        return [
-            record
-            for record in self.read_records(flow_id)
-            if start_seq <= int(record.get("seq") or 0) <= end_seq
-        ]
+    def ack_batch(self, batch_id: str) -> bool:
+        """Delete a batch's message bodies after Core checkpoint confirmation."""
+        batch_id = str(batch_id)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM buffer_batches WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return False
+                state = str(row[0])
+                if state == _ACKED:
+                    connection.commit()
+                    return True
+                if state != _INFLIGHT:
+                    connection.commit()
+                    return False
+                now = self._now()
+                connection.execute(
+                    "DELETE FROM buffer_messages WHERE batch_id=? AND status=?",
+                    (batch_id, _INFLIGHT),
+                )
+                connection.execute(
+                    "UPDATE buffer_batches SET state=?, finished_at=? WHERE batch_id=?",
+                    (_ACKED, now, batch_id),
+                )
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                raise
 
-    def get_message(self, flow_id: str, message_id: str) -> dict[str, Any] | None:
-        """按平台消息 ID 查找一条持久化消息。"""
-        target = str(message_id or "")
-        for record in self.read_records(flow_id):
-            if str(record.get("message_id") or "") == target:
-                return record
-        return None
+    def requeue_batch(self, batch_id: str) -> bool:
+        """Return unconfirmed rows to pending without changing their seq."""
+        batch_id = str(batch_id)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM buffer_batches WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return False
+                state = str(row[0])
+                if state == _REQUEUED:
+                    connection.commit()
+                    return True
+                if state != _INFLIGHT:
+                    connection.commit()
+                    return False
+                now = self._now()
+                connection.execute(
+                    """
+                    UPDATE buffer_messages
+                    SET status=?, batch_id=NULL
+                    WHERE batch_id=? AND status=?
+                    """,
+                    (_PENDING, batch_id, _INFLIGHT),
+                )
+                connection.execute(
+                    "UPDATE buffer_batches SET state=?, finished_at=? WHERE batch_id=?",
+                    (_REQUEUED, now, batch_id),
+                )
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                raise
+
+    def reconcile_inflight(
+        self,
+        flow_id: str,
+        checkpoint_counts: dict[str, int],
+        *,
+        requeue_unconfirmed: bool = False,
+    ) -> list[str]:
+        """Ack batches with a newly appended checkpoint, optionally requeue the rest."""
+        flow_id = str(flow_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT batch_id, checkpoint_id, checkpoint_baseline_count
+                FROM buffer_batches
+                WHERE flow_id=? AND state=?
+                ORDER BY created_at
+                """,
+                (flow_id, _INFLIGHT),
+            ).fetchall()
+        acked: list[str] = []
+        for row in rows:
+            checkpoint_id = str(row["checkpoint_id"])
+            observed = int(checkpoint_counts.get(checkpoint_id, 0) or 0)
+            baseline = int(row["checkpoint_baseline_count"] or 0)
+            if observed > baseline:
+                if self.ack_batch(str(row["batch_id"])):
+                    acked.append(str(row["batch_id"]))
+            elif requeue_unconfirmed:
+                self.requeue_batch(str(row["batch_id"]))
+        return acked
+
+    def read_records(self, flow_id: str) -> list[dict[str, Any]]:
+        """Return only message bodies still owned by the pending buffer."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM buffer_messages
+                WHERE flow_id=?
+                ORDER BY seq
+                """,
+                (str(flow_id),),
+            ).fetchall()
+        return [self._decode_payload(row) for row in rows]
+
+    def get_range(
+        self,
+        flow_id: str,
+        start_seq: int,
+        end_seq: int,
+        *,
+        batch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["flow_id=?", "seq BETWEEN ? AND ?"]
+        params: list[Any] = [str(flow_id), int(start_seq), int(end_seq)]
+        if batch_id:
+            clauses.append("batch_id=?")
+            params.append(str(batch_id))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM buffer_messages WHERE {' AND '.join(clauses)} ORDER BY seq",
+                params,
+            ).fetchall()
+        return [self._decode_payload(row) for row in rows]
+
+    def get_message(
+        self,
+        flow_id: str,
+        message_id: str,
+        *,
+        snapshot_seq: int | None = None,
+        batch_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        clauses = ["flow_id=?", "message_id=?"]
+        params: list[Any] = [str(flow_id), str(message_id)]
+        if snapshot_seq is not None:
+            clauses.append("seq<=?")
+            params.append(int(snapshot_seq))
+        if batch_id:
+            clauses.append("batch_id=?")
+            params.append(str(batch_id))
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT * FROM buffer_messages WHERE {' AND '.join(clauses)} LIMIT 1",
+                params,
+            ).fetchone()
+        return self._decode_payload(row) if row is not None else None
 
     def search_records(
         self,
@@ -140,12 +557,18 @@ class GroupFlowStore:
         until: int | None = None,
         max_seq: int | None = None,
         limit: int = 20,
+        batch_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """筛选本地历史，并返回受数量限制的最新匹配结果。"""
+        """Search only message bodies still in the short-lived buffer."""
         needle = str(query or "").casefold()
         sender = str(sender_id or "")
-        matches = []
-        for record in self.read_records(flow_id):
+        source_records = (
+            self.get_batch_records(batch_id)
+            if batch_id
+            else self.read_records(flow_id)
+        )
+        records = []
+        for record in source_records:
             timestamp = int(record.get("timestamp") or 0)
             if max_seq is not None and int(record.get("seq") or 0) > int(max_seq):
                 continue
@@ -157,237 +580,63 @@ class GroupFlowStore:
                 continue
             if until is not None and timestamp > int(until):
                 continue
-            matches.append(record)
+            records.append(record)
         bounded_limit = max(1, min(int(limit or 20), 100))
-        return matches[-bounded_limit:]
+        return records[-bounded_limit:]
 
-    def read_state(self) -> dict[str, Any]:
-        """以对象形式读取共享状态文档。"""
-        state = self._read_json_file(self.state_path, {})
-        return state if isinstance(state, dict) else {}
-
-    def write_state(self, state: dict[str, Any]) -> None:
-        """原子持久化共享状态文档。"""
-        self._write_json_file(self.state_path, state)
-
-    def record_run_outcome(
-        self,
-        run_id: str,
-        *,
-        flow_id: str,
-        snapshot_seq: int,
-        outcome: str,
-        detail: str = "",
-    ) -> bool:
-        """持久化结果，并允许同一轮次随 tool batch 进展更新。"""
-        state = self.read_state()
-        outcomes = state.setdefault("run_outcomes", {})
-        if not isinstance(outcomes, dict):
-            outcomes = {}
-            state["run_outcomes"] = outcomes
-        recorded_at = int(time.time())
-        existing = outcomes.get(run_id)
-        if existing is not None:
-            if not isinstance(existing, dict):
-                return False
-            try:
-                same_snapshot = int(existing.get("snapshot_seq") or 0) == int(
-                    snapshot_seq
-                )
-            except (TypeError, ValueError):
-                same_snapshot = False
-            if str(existing.get("flow_id") or "") != str(flow_id) or not same_snapshot:
-                return False
-            recorded_at = int(existing.get("recorded_at") or recorded_at)
-        outcomes[run_id] = {
-            "flow_id": flow_id,
-            "snapshot_seq": int(snapshot_seq),
-            "outcome": str(outcome),
-            "detail": str(detail),
-            "recorded_at": recorded_at,
+    def stats(self, flow_id: str, conversation_id: str | None = None) -> dict[str, Any]:
+        del conversation_id
+        flow_id = str(flow_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS inflight,
+                    COUNT(*) AS records
+                FROM buffer_messages WHERE flow_id=?
+                """,
+                (_PENDING, _INFLIGHT, flow_id),
+            ).fetchone()
+            flow = connection.execute(
+                "SELECT next_seq FROM flows WHERE flow_id=?",
+                (flow_id,),
+            ).fetchone()
+            batch = connection.execute(
+                """
+                SELECT batch_id FROM buffer_batches
+                WHERE flow_id=? AND state=? LIMIT 1
+                """,
+                (flow_id, _INFLIGHT),
+            ).fetchone()
+        next_seq = int(flow[0]) if flow is not None else 1
+        return {
+            "records": int(row["records"] or 0),
+            "pending": int(row["pending"] or 0),
+            "inflight": int(row["inflight"] or 0),
+            "latest_seq": max(0, next_seq - 1),
+            "next_seq": next_seq,
+            "active_batch": str(batch[0]) if batch is not None else None,
+            "cursor": 0,
         }
-        self.write_state(state)
-        return True
-
-    def get_run_outcome(self, run_id: str) -> dict[str, Any] | None:
-        """返回观察轮次经过分类的最终结果。"""
-        outcomes = self.read_state().get("run_outcomes", {})
-        if not isinstance(outcomes, dict):
-            return None
-        outcome = outcomes.get(run_id)
-        return outcome if isinstance(outcome, dict) else None
-
-    def import_legacy_data(self, legacy_dir: Path) -> bool:
-        """在保留源目录的前提下，一次性复制旧插件日志和状态。"""
-        legacy_dir = Path(legacy_dir)
-        if self.migration_path.exists() or not legacy_dir.is_dir():
-            return False
-        legacy_logs = legacy_dir / "logs"
-        if legacy_logs.is_dir():
-            for source in legacy_logs.glob("*.jsonl"):
-                target = self.logs_dir / source.name
-                if not target.exists():
-                    shutil.copy2(source, target)
-        legacy_state = legacy_dir / "state.json"
-        if legacy_state.is_file() and not self.state_path.exists():
-            shutil.copy2(legacy_state, self.state_path)
-        self._write_json_file(
-            self.migration_path,
-            {"source": str(legacy_dir), "migrated_at": int(time.time())},
-        )
-        return True
-
-    def get_cursor(self, flow_id: str, conversation_id: str) -> int:
-        """返回指定会话最后消费的快照序号。"""
-        state = self.read_state()
-        cursors = state.get("cursors", {})
-        if not isinstance(cursors, dict):
-            return 0
-        value = cursors.get(self._cursor_key(flow_id, conversation_id), 0)
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    def get_history_cursor(self, flow_id: str, conversation_id: str) -> int | None:
-        """返回已写入 Core 会话历史的群事实水位。"""
-        histories = self.read_state().get("history_cursors", {})
-        if not isinstance(histories, dict):
-            return None
-        try:
-            value = int(histories.get(self._cursor_key(flow_id, conversation_id)))
-        except (TypeError, ValueError):
-            return None
-        return value if value >= 0 else None
-
-    def set_cursor(
-        self,
-        flow_id: str,
-        conversation_id: str,
-        seq: int,
-        *,
-        unified_msg_origin: str,
-    ) -> None:
-        """提交会话 cursor，并保留可读的路由元数据。"""
-        state = self.read_state()
-        self._apply_cursor_state(
-            state,
-            flow_id,
-            conversation_id,
-            seq,
-            unified_msg_origin=unified_msg_origin,
-        )
-        self.write_state(state)
-
-    def _apply_cursor_state(
-        self,
-        state: dict[str, Any],
-        flow_id: str,
-        conversation_id: str,
-        seq: int,
-        *,
-        unified_msg_origin: str,
-    ) -> None:
-        """在现有 state 对象中单调更新 cursor 与路由元数据。"""
-        cursors = state.setdefault("cursors", {})
-        cursor_meta = state.setdefault("cursor_meta", {})
-        if not isinstance(cursors, dict):
-            cursors = {}
-            state["cursors"] = cursors
-        if not isinstance(cursor_meta, dict):
-            cursor_meta = {}
-            state["cursor_meta"] = cursor_meta
-
-        key = self._cursor_key(flow_id, conversation_id)
-        try:
-            current = int(cursors.get(key) or 0)
-        except (TypeError, ValueError):
-            current = 0
-        cursors[key] = max(current, 0, int(seq or 0))
-        cursor_meta[key] = {
-            "flow_id": flow_id,
-            "conversation_id": conversation_id,
-            "unified_msg_origin": unified_msg_origin,
-        }
-
-    def get_or_assign_renderer(
-        self, flow_id: str, conversation_id: str, default_renderer: str
-    ) -> str:
-        """记录并返回当前轮使用的 renderer，配置变更在下一轮生效。"""
-        state = self.read_state()
-        assignments = state.setdefault("renderer_assignments", {})
-        if not isinstance(assignments, dict):
-            assignments = {}
-            state["renderer_assignments"] = assignments
-        key = self._cursor_key(flow_id, conversation_id)
-        assigned = str(default_renderer)
-        if assignments.get(key) != assigned:
-            assignments[key] = assigned
-            self.write_state(state)
-        return assigned
-
-    def commit_observation(
-        self,
-        flow_id: str,
-        conversation_id: str,
-        seq: int,
-        *,
-        unified_msg_origin: str,
-        history_cursor: int,
-    ) -> None:
-        """在一次 state 文件替换中提交 cursor 与 Core 历史水位。"""
-        state = self.read_state()
-        self._apply_cursor_state(
-            state,
-            flow_id,
-            conversation_id,
-            seq,
-            unified_msg_origin=unified_msg_origin,
-        )
-        histories = state.setdefault("history_cursors", {})
-        if not isinstance(histories, dict):
-            histories = {}
-            state["history_cursors"] = histories
-        key = self._cursor_key(flow_id, conversation_id)
-        histories[key] = max(int(histories.get(key) or 0), int(history_cursor))
-        self.write_state(state)
 
     def clear_flow(self, flow_id: str) -> None:
-        """清除指定流水的日志与全部会话运行状态。"""
-        path = self._log_path(flow_id)
-        if path.exists():
-            path.unlink()
-
-        flow_hash = self._flow_hash(flow_id)
-        state = self.read_state()
-        for section_name in (
-            "cursors",
-            "cursor_meta",
-            "renderer_assignments",
-            "history_cursors",
-        ):
-            section = state.get(section_name, {})
-            if isinstance(section, dict):
-                for key in list(section.keys()):
-                    if str(key).startswith(f"{flow_hash}:"):
-                        section.pop(key, None)
-        outcomes = state.get("run_outcomes", {})
-        if isinstance(outcomes, dict):
-            for run_id, outcome in list(outcomes.items()):
-                if (
-                    isinstance(outcome, dict)
-                    and str(outcome.get("flow_id") or "") == flow_id
-                ):
-                    outcomes.pop(run_id, None)
-        self.write_state(state)
-
-    def stats(self, flow_id: str, conversation_id: str | None = None) -> dict[str, int]:
-        """返回记录数、最新序号和 cursor 等轻量统计。"""
-        records = self.read_records(flow_id)
-        latest_seq = max((int(item.get("seq") or 0) for item in records), default=0)
-        cursor = self.get_cursor(flow_id, conversation_id) if conversation_id else 0
-        return {
-            "records": len(records),
-            "latest_seq": latest_seq,
-            "cursor": cursor,
-        }
+        """Clear active buffer state while retaining the monotonic flow waterline."""
+        flow_id = str(flow_id)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_flow(connection, flow_id)
+                connection.execute(
+                    "DELETE FROM buffer_messages WHERE flow_id=?", (flow_id,)
+                )
+                connection.execute("DELETE FROM message_keys WHERE flow_id=?", (flow_id,))
+                connection.execute("DELETE FROM buffer_batches WHERE flow_id=?", (flow_id,))
+                connection.execute(
+                    "UPDATE flows SET updated_at=? WHERE flow_id=?",
+                    (self._now(), flow_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise

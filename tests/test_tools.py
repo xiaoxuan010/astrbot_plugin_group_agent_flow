@@ -148,12 +148,12 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
         "properties": {},
     }
     poke_tool = tool_set.get_tool("poke_user")
-    assert "available chat history" in poke_tool.description
+    assert "current frozen message set" in poke_tool.description
     assert "snapshot" not in poke_tool.description.lower()
     user_id_description = poke_tool.parameters["properties"]["user_id"][
         "description"
     ]
-    assert "available chat history" in user_id_description
+    assert "current frozen message set" in user_id_description
     assert "snapshot" not in user_id_description.lower()
     react_tool = tool_set.get_tool("react_message")
     assert react_tool.parameters["properties"]["reaction"]["enum"] == [
@@ -709,16 +709,11 @@ async def test_multiple_external_actions_execute_in_one_run(tmp_path):
         action["action_name"]
         for action in event.get_extra("_group_agent_external_actions")
     ] == ["react_message", "reply_message"]
-    action_records = [
+    assert [
         record
         for record in store.read_records("napcat:group:1")
         if record.get("record_kind") == "agent_action"
-    ]
-    assert [record["action_name"] for record in action_records] == [
-        "react_message",
-        "reply_message",
-    ]
-    assert [record["action_index"] for record in action_records] == [1, 2]
+    ] == []
 
 
 @pytest.mark.asyncio
@@ -755,11 +750,7 @@ async def test_external_message_tool_returns_structured_result_without_finalizin
     assert event.get_extra("_group_agent_external_actions") == [
         {"action_name": "send_message", "status": "succeeded", "detail": ""}
     ]
-    records = runtime.store.read_records("napcat:group:1")
-    assert len(records) == 1
-    assert records[0]["record_kind"] == "agent_action"
-    assert records[0]["action_name"] == "send_message"
-    assert records[0]["text"] == "B"
+    assert runtime.store.read_records("napcat:group:1") == []
 
 
 @pytest.mark.asyncio
@@ -791,10 +782,7 @@ async def test_external_action_allows_follow_up_provider_call_until_stay_silent(
     assert runner.done() is True
     assert provider.call_count == 3
     assert len(event.sent) == 2
-    assert [record["action_name"] for record in store.read_records("napcat:group:1")] == [
-        "send_message",
-        "send_message",
-    ]
+    assert store.read_records("napcat:group:1") == []
 
 
 @pytest.mark.asyncio
@@ -1037,23 +1025,12 @@ async def test_external_action_failure_omits_empty_detail(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_action_encoding_failure_returns_successful_result_after_send(
-    tmp_path,
-    monkeypatch,
-):
+async def test_action_success_does_not_create_legacy_fact_after_send(tmp_path):
     finalized = []
 
     async def finalize(event):
         finalized.append(event)
 
-    def fail_encode(*_args, **_kwargs):
-        raise ValueError("invalid receipt")
-
-    monkeypatch.setattr(
-        agent_tools_module,
-        "build_agent_action_record",
-        fail_encode,
-    )
     store = GroupFlowStore(tmp_path)
     runtime = ToolRuntime(
         store,
@@ -1067,8 +1044,7 @@ async def test_action_encoding_failure_returns_successful_result_after_send(
         content="A",
     )
 
-    assert result == ('{"success":true,"action":"send_message",'
-                      '"fact_error":"fact_encode_failed:ValueError"}')
+    assert result == '{"success":true,"action":"send_message"}'
     assert len(event.sent) == 1
     assert finalized == []
     assert store.read_records("napcat:group:1") == []
@@ -1076,14 +1052,14 @@ async def test_action_encoding_failure_returns_successful_result_after_send(
         {
             "action_name": "send_message",
             "status": "succeeded",
-            "detail": "fact_encode_failed:ValueError",
+            "detail": "",
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_action_persistence_failure_returns_successful_result_after_send(tmp_path):
-    finalized = []
+async def test_action_success_ignores_legacy_action_persistence_callback(tmp_path):
+    callback_calls = []
 
     async def fail_persist(
         _flow_id,
@@ -1092,17 +1068,11 @@ async def test_action_persistence_failure_returns_successful_result_after_send(t
         run_id,
         generation,
     ):
-        assert run_id == "run-1"
-        assert generation == 0
-        raise OSError("disk full")
-
-    async def finalize(event):
-        finalized.append(event)
+        callback_calls.append((_flow_id, _record, run_id, generation))
 
     runtime = ToolRuntime(
         GroupFlowStore(tmp_path),
         QQActionGateway(),
-        terminal_callback=finalize,
         action_persist_callback=fail_persist,
     )
     event = FakeEvent()
@@ -1112,15 +1082,14 @@ async def test_action_persistence_failure_returns_successful_result_after_send(t
         content="A",
     )
 
-    assert result == ('{"success":true,"action":"send_message",'
-                      '"fact_error":"fact_persist_failed:OSError"}')
+    assert result == '{"success":true,"action":"send_message"}'
     assert len(event.sent) == 1
-    assert finalized == []
+    assert callback_calls == []
     assert event.get_extra("_group_agent_external_actions") == [
         {
             "action_name": "send_message",
             "status": "succeeded",
-            "detail": "fact_persist_failed:OSError",
+            "detail": "",
         }
     ]
 
@@ -1165,7 +1134,7 @@ async def test_stale_run_is_rejected_before_external_gateway_call(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_admitted_gateway_action_can_finish_while_stale_fact_is_rejected(
+async def test_admitted_gateway_action_has_no_legacy_fact_write(
     tmp_path,
 ):
     admitted = []
@@ -1192,18 +1161,15 @@ async def test_admitted_gateway_action_can_finish_while_stale_fact_is_rejected(
         content="already admitted",
     )
 
-    assert result == (
-        '{"success":true,"action":"send_message",'
-        '"fact_error":"fact_persist_failed:RuntimeError"}'
-    )
+    assert result == '{"success":true,"action":"send_message"}'
     assert admitted == [("napcat:group:1", "run-1", 0)]
     assert len(event.sent) == 1
-    assert len(persisted) == 1
+    assert persisted == []
     assert event.get_extra("_group_agent_external_actions") == [
         {
             "action_name": "send_message",
             "status": "succeeded",
-            "detail": "fact_persist_failed:RuntimeError",
+            "detail": "",
         }
     ]
 
@@ -1242,58 +1208,6 @@ async def test_history_tools_return_records_without_claiming_terminal_slot(tmp_p
     assert message["message_id"] == "m1"
     assert [item["message_id"] for item in search["messages"]] == ["m1"]
     assert event.get_extra("_group_agent_external_actions", []) == []
-
-
-@pytest.mark.asyncio
-async def test_action_facts_are_readable_but_cannot_be_qq_targets(tmp_path):
-    store = GroupFlowStore(tmp_path)
-    action_id = "agent-action:run-1:1"
-    store.append_record(
-        "napcat:group:1",
-        {
-            "record_kind": "agent_action",
-            "message_id": action_id,
-            "targetable": False,
-            "sender_id": "7",
-            "text": "已经回复",
-            "components": [{"type": "text", "text": "已经回复"}],
-        },
-    )
-    event = FakeEvent()
-    event.extras["_group_agent_snapshot_seq"] = 1
-    tools = ToolRuntime(store, QQActionGateway()).build_tool_set()
-
-    observed = json.loads(
-        await tools.get_tool("get_message").handler(event, message_id=action_id)
-    )
-    search = json.loads(
-        await tools.get_tool("search_chat_history").handler(event, query="已经回复")
-    )
-    reply = json.loads(
-        await tools.get_tool("reply_message").handler(
-            event,
-            message_id=action_id,
-            content="again",
-        )
-    )
-    reaction = json.loads(
-        await tools.get_tool("react_message").handler(
-            event,
-            message_id=action_id,
-            reaction="赞",
-        )
-    )
-    poke = json.loads(
-        await tools.get_tool("poke_user").handler(event, user_id="7")
-    )
-
-    assert observed["message_id"] == action_id
-    assert [item["message_id"] for item in search["messages"]] == [action_id]
-    assert reply["error"] == "message_not_found_in_snapshot"
-    assert reaction["error"] == "message_not_found_in_snapshot"
-    assert poke["error"] == "user_not_found_in_snapshot"
-    assert event.sent == []
-    assert event.bot.actions == []
 
 
 @pytest.mark.asyncio

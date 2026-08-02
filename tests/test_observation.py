@@ -22,23 +22,6 @@ def _record(message_id: str, text: str) -> dict:
     }
 
 
-def _action_record(message_id: str, text: str) -> dict:
-    return {
-        "record_kind": "agent_action",
-        "message_id": message_id,
-        "targetable": False,
-        "group_id": "1",
-        "sender_id": "bot",
-        "self_id": "bot",
-        "timestamp": 1710000001,
-        "text": text,
-        "components": [{"type": "text", "text": text}],
-        "action_name": "reply_message",
-        "action_status": "succeeded",
-        "target_message_id": "m1",
-    }
-
-
 def _prepare(
     store: GroupFlowStore,
     *,
@@ -62,27 +45,10 @@ def _count_contexts(contexts: tuple[dict, ...] | list[dict]) -> int:
     return EstimateTokenCounter().count_tokens(messages)
 
 
-def test_missing_history_cursor_ignores_legacy_window_and_rebuilds_from_zero(
-    tmp_path,
-):
+def test_observation_rebuilds_from_current_buffer_rows(tmp_path):
     store = GroupFlowStore(tmp_path)
     for index in range(1, 5):
-        store.append_record(FLOW_ID, _record(f"m{index}", f"message {index}"))
-    store.set_cursor(
-        FLOW_ID,
-        CONVERSATION_ID,
-        3,
-        unified_msg_origin="qq:GroupMessage:1",
-    )
-    key = store._cursor_key(FLOW_ID, CONVERSATION_ID)
-    state = store.read_state()
-    state["observation_windows"] = {
-        key: {
-            "renderer": "native_messages",
-            "blocks": [{"start_seq": 3, "end_seq": 3}],
-        }
-    }
-    store.write_state(state)
+        store.append_pending(FLOW_ID, _record(f"m{index}", f"message {index}"))
 
     prepared = _prepare(
         store,
@@ -100,18 +66,13 @@ def test_missing_history_cursor_ignores_legacy_window_and_rebuilds_from_zero(
     assert prepared.target_cursor == 4
 
 
-def test_existing_history_cursor_selects_delta_and_excludes_agent_actions(tmp_path):
+def test_existing_history_cursor_selects_only_the_new_suffix(tmp_path):
     store = GroupFlowStore(tmp_path)
-    store.append_record(FLOW_ID, _record("m1", "kept history"))
-    store.append_record(
-        FLOW_ID,
-        _action_record("agent-action:run-1:1", "old action"),
-    )
-    store.append_record(FLOW_ID, _record("m3", "latest"))
-    prepared = _prepare(store, snapshot_seq=3, history_cursor=2)
+    store.append_pending(FLOW_ID, _record("m1", "kept history"))
+    store.append_pending(FLOW_ID, _record("m2", "latest"))
+    prepared = _prepare(store, snapshot_seq=2, history_cursor=1)
 
-    assert prepared.source_seqs == (3,)
-    assert "old action" not in prepared.contexts[0]["content"]
+    assert prepared.source_seqs == (2,)
     assert "kept history" not in prepared.contexts[0]["content"]
     assert "latest" in prepared.contexts[0]["content"]
 
@@ -122,8 +83,8 @@ def test_existing_history_cursor_selects_delta_and_excludes_agent_actions(tmp_pa
 )
 def test_existing_history_cursor_renders_only_the_new_suffix(tmp_path, renderer_name):
     store = GroupFlowStore(tmp_path)
-    store.append_record(FLOW_ID, _record("m1", "first"))
-    store.append_record(FLOW_ID, _record("m2", "second"))
+    store.append_pending(FLOW_ID, _record("m1", "first"))
+    store.append_pending(FLOW_ID, _record("m2", "second"))
 
     prepared = _prepare(
         store,
@@ -141,7 +102,7 @@ def test_existing_history_cursor_renders_only_the_new_suffix(tmp_path, renderer_
 def test_latest_block_drops_oldest_records_until_under_hard_limit(tmp_path):
     store = GroupFlowStore(tmp_path)
     for index in range(1, 5):
-        store.append_record(FLOW_ID, _record(f"m{index}", str(index) * 500))
+        store.append_pending(FLOW_ID, _record(f"m{index}", str(index) * 500))
 
     prepared = _prepare(
         store,
@@ -157,7 +118,7 @@ def test_latest_block_drops_oldest_records_until_under_hard_limit(tmp_path):
 def test_single_oversized_message_keeps_metadata_tail_and_lookup_marker(tmp_path):
     store = GroupFlowStore(tmp_path)
     original = "BEGIN-" + ("x" * 5000) + "-TAIL"
-    store.append_record(FLOW_ID, _record("oversized", original))
+    store.append_pending(FLOW_ID, _record("oversized", original))
 
     prepared = _prepare(
         store,
@@ -179,7 +140,7 @@ def test_single_oversized_message_keeps_metadata_tail_and_lookup_marker(tmp_path
 
 def test_impossibly_small_token_budget_fails_instead_of_exceeding_limit(tmp_path):
     store = GroupFlowStore(tmp_path)
-    store.append_record(FLOW_ID, _record("oversized", "content"))
+    store.append_pending(FLOW_ID, _record("oversized", "content"))
 
     with pytest.raises(ValueError, match="max_context_tokens"):
         _prepare(
@@ -192,7 +153,7 @@ def test_impossibly_small_token_budget_fails_instead_of_exceeding_limit(tmp_path
 
 def test_prepare_observation_ignores_transport_events_without_model_content(tmp_path):
     store = GroupFlowStore(tmp_path)
-    store.append_record(
+    store.append_pending(
         FLOW_ID,
         {
             "message_id": "empty",

@@ -144,14 +144,32 @@ def prepare_observation(
     max_context_tokens: int,
     history_cursor: int | None = None,
 ) -> PreparedObservation:
-    """构建 bootstrap 后缀或水位后的 observation 增量。"""
+    """构建仍在 Buffer 中的 observation 增量。"""
+    all_records = store.get_range(flow_id, 1, int(snapshot_seq))
+    return prepare_observation_records(
+        all_records,
+        snapshot_seq=snapshot_seq,
+        renderer_name=renderer_name,
+        max_context_tokens=max_context_tokens,
+        history_cursor=history_cursor,
+    )
+
+
+def prepare_observation_records(
+    records: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    snapshot_seq: int,
+    renderer_name: str,
+    max_context_tokens: int,
+    history_cursor: int | None = None,
+) -> PreparedObservation:
+    """Render exactly the supplied immutable batch rows, without storage reads."""
     cursor = max(0, int(history_cursor)) if history_cursor is not None else 0
     renderer = build_renderer(renderer_name)
     counter = EstimateTokenCounter()
     hard_limit = max(1, int(max_context_tokens))
 
-    all_records = store.get_range(flow_id, 1, int(snapshot_seq))
-    visible_records = [record for record in all_records if _is_model_visible(record)]
+    visible_records = [record for record in records if _is_model_visible(record)]
     if history_cursor is not None:
         visible_records = [record for record in visible_records if str(record.get("record_kind") or "group_message") != "agent_action"]
     latest_records = [record for record in visible_records if _seq(record) > cursor]

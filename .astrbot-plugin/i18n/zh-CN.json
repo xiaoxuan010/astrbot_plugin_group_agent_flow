@@ -41,8 +41,8 @@
         "hint": "使用 AstrBot Core 的 token 计数器。最新观察块单独超限时会优先裁剪其中的旧记录；更早记录仍可通过历史工具检索。"
       },
       "max_log_records": {
-        "description": "每群最大持久化记录数",
-        "hint": "0 表示不裁剪历史记录。"
+        "description": "每群最大 pending/inflight Buffer 记录数",
+        "hint": "0 表示不限制 Buffer 容量；已确认消息正文会删除。"
       },
       "max_text_chars": {
         "description": "单条消息最大存储文本长度"
@@ -52,8 +52,8 @@
         "hint": "启用后，机器人消息的回传事件可以进入后续快照并启动新的推理周期。"
       },
       "record_empty_messages": {
-        "description": "记录无文本或组件的消息",
-        "hint": "无内容的传输事件仅用于诊断，进入模型前会被跳过。"
+        "description": "无内容事件的旧配置兼容项",
+        "hint": "无内容传输事件不会写入 SQLite Buffer，也不会发送给模型。"
       }
     },
     "prompt": {

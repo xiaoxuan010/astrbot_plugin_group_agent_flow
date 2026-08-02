@@ -2,11 +2,11 @@
 
 面向 QQ 群聊的自主 Agent 插件。项目 fork 自
 [`astrbot_plugin_group_context_flow`](https://github.com/Tsukumi233/astrbot_plugin_group_context_flow)，
-保留其持久化增量上下文能力，并将触发和回复流程改为固定快照与工具调用。
+保留其固定快照与工具调用流程，并将待处理消息持久化边界收敛为插件自有 SQLite Buffer。
 
 ## Phase 1 行为
 
-消息按群持久化后进入 `WAITING -> DEBOUNCE -> SNAPSHOT -> REASONING -> TOOL ACTION`。
+消息先进入插件自有 SQLite Buffer，再进入 `WAITING -> DEBOUNCE -> SNAPSHOT -> REASONING -> TOOL ACTION`。
 推理开始时冻结 `snapshot_seq`，推理期间到达的消息进入下一轮，也不会让当前轮重判。
 每个群同时计算全局与定向启动资格：全局路径沿用 `debounce_seconds` / `direct_delay_seconds`
 和 `min_cycle_interval_seconds`，定向路径使用 `direct_delay_seconds` 和
@@ -56,28 +56,24 @@ Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主
 四个 option value 为兼容已保存配置保持不变。`---` 是人为分隔协议，提供比普通换行更明显的
 记录边界；仓库中尚无模型评测能确定最优格式。修改 `context.renderer` 后，同一群聊的下一轮请求
 立即采用新投影格式；已进入 AstrBot Core 会话的 `user`、`assistant`、`tool` 原始历史及 reasoning
-保持原样，增量 JSONL 只投影尚未进入该会话的新记录。
+保持原样，SQLite 只投影尚未交给 Core 的当前 batch 记录。
 
-首次观察会清空 AstrBot conversation contexts 并建立基线；后续请求保留 Core 多角色历史，附加本轮
-增量投影，并把 observation 估算量追加到已持久化的 conversation token usage 基线。`max_context_tokens` 默认 8192，使用 AstrBot Core
-`EstimateTokenCounter` 计数。缺少 `history_cursor` 时从 cursor `0` 重建最近 JSONL 后缀；
-已有水位时只投影水位后的群事实。观察增量超限时会移除其中最旧记录；单条记录仍超限时保留元数据、内容尾部和 `get_message`
-查询提示。更早的完整记录始终保留在 JSONL 中，可通过历史工具读取。
+观察请求保留 AstrBot Core 的多角色 conversation history，只追加当前 SQLite batch 的群事实，并把
+估算量追加到 Core 的 token usage 基线。`max_context_tokens` 默认 8192，使用 AstrBot Core
+`EstimateTokenCounter` 计数。观察增量超限时会移除其中最旧记录；单条记录仍超限时保留元数据、内容尾部和
+`get_message` 查询提示。batch 被 Core checkpoint 确认后，SQLite 消息正文删除；更早消息由 NapCat
+历史接口按需查询。
 
-插件热重载或 `/gaf_clear` 会让旧调度 run 失效。旧 run 后续的 cursor、窗口和动作事实回写会被
-拒绝；清理先于动作准入时，QQ 网关也不会执行该动作。无文本且无组件的适配器传输事件可以保留
-用于诊断，进入模型前会被过滤。
+插件热重载或 `/gaf_clear` 会让旧调度 run 失效。旧 run 后续的 Buffer 状态回写会被拒绝；清理先于动作
+准入时，QQ 网关也不会执行该动作。无文本且无组件的适配器传输事件不进入 Buffer，也不会触发模型。
 
-`stay_silent` 返回 `None` 后，AstrBot Agent history 可能跳过该轮 tool call/result；插件 JSONL
-承担完整群聊事实来源。入站事件保存为 `record_kind=group_message`，成功执行的
-`send_message`、`reply_message`、`react_message`、`poke_user` 保存为
-`record_kind=agent_action`。下一轮 renderer 会明确投影 `actor=bot`、动作、目标和成功状态。
-动作事实与群消息共同进入持久化观察块；活动窗口内的已完成动作会随对应块稳定重建。
-动作内部 ID 使用 `action_id=` 展示，并禁止作为 QQ reply/react 目标。
+`stay_silent` 返回 `None` 后，AstrBot Core 负责保存可用的 tool call/result history；插件不再创建
+`agent_action` 记录，也不复制 Core 的 assistant/tool/reasoning。入站事件保存为
+`record_kind=group_message`，仅在等待或处理中的 batch 内短暂保留。
 
 纯普通 `content` 会标记为不保存；与工具调用同响应的 `content` 仅作为本轮 Provider
 协议上下文保留，始终不会发送到群内。群消息原始组件、`message_id`、`reply_to`、发送者和
-时间戳存放在插件 JSONL 中，较早内容可通过历史工具按需读取。引用机器人消息会记录为直接
+时间戳存放在当前 SQLite Buffer 中。引用机器人消息会记录为直接
 面向机器人；NapCat 的群戳一戳通知会记录发起者和目标 QQ，戳到机器人时同样写入定向标记。
 `poke_user` 仅接受冻结快照中已经出现的 QQ 用户。
 
@@ -102,15 +98,15 @@ AstrBot 群聊 LTM，避免维护一份闲置的重复记录。插件会接管�
 事件层阻止内置 `active_reply` 的概率回复。
 
 日常运行建议保持 `record_self_messages: false`。启用后，QQ 适配器回传的机器人消息也可能进入
-后续快照并启动新周期。`record_empty_messages` 只控制诊断记录保留；完全空白的传输事件不会触发模型。
+后续快照并启动新周期。`record_empty_messages` 仅作为旧配置兼容项；完全空白的传输事件不会写入 SQLite，也不会触发模型。
 
-旧插件目录 `data/plugin_data/astrbot_plugin_group_context_flow` 会在首次启动时复制到新目录，
-迁移标记保证该过程只执行一次。原目录保持不变。
+旧插件目录 `data/plugin_data/astrbot_plugin_group_context_flow` 及当前插件下已有的 `logs/*.jsonl`
+和 `state.json` 会保留为只读材料；切换到 SQLite 时不导入、不删除、不再双写。
 
 ## 指令
 
-- `/gaf_status`：查看授权状态、消息记录数、快照游标和 conversation。
-- `/gaf_clear`：管理员清空当前群的日志、游标、观察窗口、运行结果和内存调度状态。
+- `/gaf_status`：查看授权状态、SQLite pending/inflight 数量、最新 seq 和活动 batch。
+- `/gaf_clear`：管理员清空当前群的 SQLite Buffer、Core conversation 和内存调度状态，不删除旧 JSONL/state。
 
 ## 本地测试
 

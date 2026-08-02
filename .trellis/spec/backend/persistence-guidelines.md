@@ -1,48 +1,75 @@
 # Persistence Guidelines
 
-## Storage Model
+## Current Storage Model: SQLite Pending Buffer
 
-The plugin has no ORM or application database. `GroupFlowStore` in `store.py` owns two forms
-of local persistence under `data/plugin_data/astrbot_plugin_group_agent_flow/`:
+`GroupFlowStore` in `store.py` owns one SQLite file at
+`data/plugin_data/astrbot_plugin_group_agent_flow/group_agent_flow.db`. The active runtime
+stores only `group_message` rows whose lifecycle is `pending -> inflight -> ack/delete`.
+AstrBot Core conversation history owns assistant/tool/reasoning history; NapCat owns already
+sent QQ history. Existing `logs/*.jsonl` and `state.json` are legacy read-only material and
+are neither imported nor written after cutover.
 
-- Per-flow JSONL logs contain normalized group events with monotonic `seq` values.
-- `state.json` contains conversation cursors, renderer assignments, history cursors,
-  cursor metadata, and per-run outcomes.
+### Scenario: SQLite Buffer claim and Core checkpoint acknowledgement
 
-Flow filenames are SHA-256-derived so platform and group identifiers never become paths.
-Use `GroupFlowStore` methods for every read or write; callers should not know log filenames.
+#### 1. Scope / Trigger
 
-## Write Rules
+An autonomous group event must survive restart without duplicating Core conversation history
+or treating a completed batch as a permanent local archive.
 
-- Rewrite JSON and JSONL through a sibling `.tmp` file followed by `os.replace`, matching
-  `_write_json_file()` and `write_records()`.
-- Deduplicate incoming events by non-empty `message_id` before assigning a new sequence.
-- Keep sequence values increasing even when retention trims old records.
-- Keep each conversation cursor monotonically increasing. A delayed or stale run may finish
-  after a newer run and must never move the cursor backwards.
-- Persist a conversation's cursor and history cursor only after a successful run. Both values
-  are committed through one state-file replacement under the per-flow lock after validating
-  the run generation.
-- Bound user-facing search limits to 1-100 records.
-- Apply `max_seq` before the result limit so an observation cannot see messages newer than
-  its frozen snapshot.
+#### 2. Signatures
 
-`main.py` serializes flow mutations with a per-flow `asyncio.Lock`. Store methods remain
-synchronous and perform no `await`, which keeps each individual state update atomic within
-the event-loop thread.
+- `GroupFlowStore.append_pending(flow_id, record) -> AppendResult(seq, inserted)`
+- `GroupFlowStore.claim_batch(flow_id, snapshot_seq, *, checkpoint_id=None, checkpoint_baseline_count=0) -> BatchSnapshot | None`
+- `GroupFlowStore.ack_batch(batch_id) -> bool`
+- `GroupFlowStore.requeue_batch(batch_id) -> bool`
+- `GroupFlowStore.reconcile_inflight(flow_id, checkpoint_counts, *, requeue_unconfirmed=False) -> list[str]`
 
-## Compatibility And Migration
+#### 3. Contracts
 
-Persisted records carry `schema_version`. Preserve readable old fields when evolving the
-schema. `import_legacy_data()` copies the old plugin's logs/state once and writes
-`legacy_migration.json`; never delete or rewrite the legacy source directory.
+- SQLite uses `PRAGMA user_version=1`, WAL, foreign keys, a five-second busy timeout, short-lived
+  connections, and `BEGIN IMMEDIATE` for writes.
+- `flows.next_seq` is the next monotonic sequence and is not reset by ack or `/gaf_clear`.
+- `message_keys(flow_id,message_id)` retains only deduplication metadata after message bodies are deleted.
+- `buffer_messages` stores the full JSON envelope in `payload_json`; unknown fields/components round-trip.
+- `claim_batch` atomically marks `pending` rows with `seq <= snapshot_seq` as `inflight` and returns an
+  immutable `BatchSnapshot`; later arrivals remain pending.
+- The plugin sets `event.extra["llm_checkpoint_id"]` to a scoped `gaf:` ID only when no existing non-empty
+  ID exists. Core persists `_checkpoint` internally and strips it before Provider-facing messages.
+- A newly observed checkpoint count acknowledges and deletes the batch body. A missing checkpoint with
+  `requeue_unconfirmed=True` returns the batch to pending without changing seq.
+- `agent_action` is rejected by `append_pending`; successful action/tool history remains Core-owned.
 
-Malformed JSON state falls back to an empty object. Invalid JSONL lines are skipped while
-valid records remain readable. Add migration and reload tests in `tests/test_store.py` for
-every persistence contract change.
+#### 4. Validation & Error Matrix
 
-Avoid ad hoc file writes, path names derived directly from QQ IDs, and cursor advancement
-beyond the run's `snapshot_seq`.
+- non-`group_message` record -> `ValueError`, no SQLite row;
+- duplicate non-empty message ID -> existing seq, `inserted=False`, no new body;
+- positive `max_log_records` at capacity -> `BufferCapacityError`, inflight rows preserved;
+- active inflight batch -> `ActiveBatchError`, no second claim;
+- malformed DB/schema -> `StoreInitializationError`, legacy files untouched;
+- ack/requeue repeated -> idempotent state result, no second body mutation.
+
+#### 5. Good/Base/Bad Cases
+
+- Good: claim rows 8-10, receive seq 11 during reasoning, current batch contains only 8-10.
+- Base: Core history gains a new matching `_checkpoint`; next event deletes 8-10 and keeps seq 11 pending.
+- Bad: append successful tool actions as new user facts, or put `batch_id` in `ProviderRequest.contexts`.
+
+#### 6. Tests Required
+
+- SQLite schema/reopen/WAL and corrupt-database tests;
+- duplicate, concurrent seq, capacity, unknown-field round-trip, claim boundary, ack/requeue and clear tests;
+- checkpoint baseline-count test proving an old same-ID segment does not ack a new batch;
+- main/tool tests proving batch ID is private and Core checkpoint is the only ack signal.
+
+#### 7. Wrong vs Correct
+
+Wrong: advance a local history cursor and delete JSONL immediately after `on_llm_response`.
+
+Correct: hold bodies as `inflight` until Core raw history contains the newly appended checkpoint, then ack/delete.
+
+`main.py` still serializes flow mutations with a per-flow `asyncio.Lock`; SQLite transactions remain the
+final cross-thread boundary. Historical scenario text below describes older JSONL/cursor behavior and is
+retained only as migration context; new runtime code must follow the SQLite contract above.
 
 ## Scenario: An external action enters the group fact stream
 

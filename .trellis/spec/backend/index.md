@@ -1,7 +1,8 @@
 # Backend Development Guidelines
 
 This repository is a single-package Python plugin for AstrBot. The runtime boundary is
-AstrBot's event and Agent hook API; local state is stored as JSONL and JSON files.
+AstrBot's event and Agent hook API; active pending state is stored in a plugin-owned
+SQLite Buffer. Legacy JSONL/JSON files remain read-only compatibility material.
 
 | Guide | Scope |
 |---|---|

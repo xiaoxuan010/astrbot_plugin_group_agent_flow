@@ -1,5 +1,14 @@
 # Quality Guidelines
 
+## Current SQLite Buffer Contract
+
+The active runtime uses the plugin-owned SQLite Buffer contract in
+`persistence-guidelines.md`: only `group_message` rows in `pending`/`inflight` are
+stored locally. Core conversation history owns assistant/tool/reasoning history and
+successful external actions; no `agent_action` row is appended by the active runtime.
+The JSONL/cursor/action-fact bullets and scenarios below are retained as legacy review
+context only and must not override the current SQLite lifecycle.
+
 ## Required Patterns
 
 - Keep snapshot isolation end to end. Context preparation, history search, message lookup,

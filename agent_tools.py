@@ -11,14 +11,12 @@ from astrbot.core.utils.media_utils import resolve_image_ref_to_base64_data
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 try:
-    from .event_codec import build_agent_action_record
     from .qq_gateway import QQActionGateway, SUPPORTED_REACTIONS
-    from .response_policy import EXTERNAL_ACTIONS_EXTRA, record_external_action
+    from .response_policy import record_external_action
     from .store import GroupFlowStore
 except ImportError:
-    from event_codec import build_agent_action_record
     from qq_gateway import QQActionGateway, SUPPORTED_REACTIONS
-    from response_policy import EXTERNAL_ACTIONS_EXTRA, record_external_action
+    from response_policy import record_external_action
     from store import GroupFlowStore
 
 PLUGIN_NAME = "astrbot_plugin_group_agent_flow"
@@ -27,6 +25,9 @@ FLOW_ID_EXTRA = "_group_agent_flow_id"
 SNAPSHOT_SEQ_EXTRA = "_group_agent_snapshot_seq"
 RUN_GENERATION_EXTRA = "_group_agent_run_generation"
 SILENCE_SELECTED_EXTRA = "_group_agent_silence_selected"
+BATCH_ID_EXTRA = "_group_agent_batch_id"
+BATCH_RECORDS_EXTRA = "_group_agent_batch_records"
+CHECKPOINT_ID_EXTRA = "_group_agent_checkpoint_id"
 
 
 def _json(payload: Any) -> str:
@@ -52,26 +53,17 @@ class ToolRuntime:
         | None = None,
         context: Any | None = None,
     ) -> None:
-        """将持久化动作状态与 QQ 副作用网关组合起来。"""
+        """组合 SQLite snapshot reads with QQ side effects.
+
+        ``action_persist_callback`` remains an ignored compatibility argument;
+        Core conversation owns successful action/tool history.
+        """
         self.store = store
         self.gateway = gateway
         self.context = context
         self.terminal_callback = terminal_callback
-        self.action_persist_callback = (
-            action_persist_callback or self._append_action_record
-        )
+        del action_persist_callback
         self.action_admission_callback = action_admission_callback
-
-    async def _append_action_record(
-        self,
-        flow_id: str,
-        record: dict[str, Any],
-        *,
-        run_id: str,
-        generation: int,
-    ) -> int:
-        """为独立 ToolRuntime 构造提供默认的事实写入路径。"""
-        return self.store.append_record(flow_id, record)
 
     @staticmethod
     def _run_metadata(event: Any) -> tuple[str, str, int, int]:
@@ -85,31 +77,55 @@ class ToolRuntime:
         return run_id, flow_id, snapshot_seq, generation
 
     def _message_in_snapshot(
-        self, flow_id: str, message_id: str, snapshot_seq: int
+        self,
+        flow_id: str,
+        message_id: str,
+        snapshot_seq: int,
+        batch_id: str = "",
     ) -> dict[str, Any] | None:
         """仅当消息属于冻结快照时返回其记录。"""
-        record = self.store.get_message(flow_id, message_id)
-        if record is None or int(record.get("seq") or 0) > snapshot_seq:
-            return None
-        return record
+        return self.store.get_message(
+            flow_id,
+            message_id,
+            snapshot_seq=snapshot_seq,
+            batch_id=batch_id or None,
+        )
 
     def _target_message_in_snapshot(
-        self, flow_id: str, message_id: str, snapshot_seq: int
+        self,
+        flow_id: str,
+        message_id: str,
+        snapshot_seq: int,
+        batch_id: str = "",
     ) -> dict[str, Any] | None:
         """只返回可映射到平台消息 ID 的快照记录。"""
-        record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+        record = self._message_in_snapshot(
+            flow_id,
+            message_id,
+            snapshot_seq,
+            batch_id,
+        )
         if record is None or record.get("targetable") is False:
             return None
         return record
 
-    def _user_in_snapshot(self, flow_id: str, user_id: str, snapshot_seq: int) -> bool:
+    def _user_in_snapshot(
+        self,
+        flow_id: str,
+        user_id: str,
+        snapshot_seq: int,
+        batch_id: str = "",
+    ) -> bool:
         """确认 QQ 用户作为发送者、提及或戳一戳目标出现在冻结快照中。"""
         target = str(user_id or "")
         if not target:
             return False
-        for record in self.store.read_records(flow_id):
-            if int(record.get("seq") or 0) > snapshot_seq:
-                continue
+        for record in self.store.get_range(
+            flow_id,
+            1,
+            snapshot_seq,
+            batch_id=batch_id or None,
+        ):
             if str(record.get("record_kind") or "group_message") == "agent_action":
                 continue
             if str(record.get("sender_id") or "") == target:
@@ -197,7 +213,7 @@ class ToolRuntime:
                     }
                 )
         try:
-            action_result = await operation()
+            await operation()
         except Exception as exc:
             detail = await self.gateway.failure_detail(
                 event,
@@ -219,51 +235,13 @@ class ToolRuntime:
                 result["detail"] = detail
             return _json(result)
         else:
-            actions = event.get_extra(EXTERNAL_ACTIONS_EXTRA, [])
-            action_index = len(actions) + 1 if isinstance(actions, list) else 1
-            detail = ""
-            try:
-                record = build_agent_action_record(
-                    event,
-                    run_id=run_id,
-                    action_index=action_index,
-                    action_name=action_name,
-                    action_result=action_result,
-                )
-            except Exception as exc:
-                detail = f"fact_encode_failed:{type(exc).__name__}"
-                logger.error(
-                    f"[{PLUGIN_NAME}] failed to encode agent action fact "
-                    f"flow_id={flow_id} run_id={run_id} "
-                    f"action={action_name} error={type(exc).__name__}",
-                    exc_info=True,
-                )
-            else:
-                try:
-                    await self.action_persist_callback(
-                        flow_id,
-                        record,
-                        run_id=run_id,
-                        generation=generation,
-                    )
-                except Exception as exc:
-                    detail = f"fact_persist_failed:{type(exc).__name__}"
-                    logger.error(
-                        f"[{PLUGIN_NAME}] failed to persist agent action fact "
-                        f"flow_id={flow_id} run_id={run_id} "
-                        f"action={action_name} error={type(exc).__name__}",
-                        exc_info=True,
-                    )
             record_external_action(
                 event,
                 action_name=action_name,
                 success=True,
-                detail=detail,
+                detail="",
             )
-            result: dict[str, Any] = {"success": True, "action": action_name}
-            if detail:
-                result["fact_error"] = detail
-            return _json(result)
+            return _json({"success": True, "action": action_name})
 
     def build_tool_set(self, event: Any | None = None) -> ToolSet:
         """为每次请求创建独立工具集，避免共享可变工具对象。"""
@@ -288,8 +266,14 @@ class ToolRuntime:
         ) -> str:
             """仅引用回复当前快照中可见的消息。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
             if (
-                self._target_message_in_snapshot(flow_id, message_id, snapshot_seq)
+                self._target_message_in_snapshot(
+                    flow_id,
+                    message_id,
+                    snapshot_seq,
+                    batch_id,
+                )
                 is None
             ):
                 return _json(
@@ -313,8 +297,14 @@ class ToolRuntime:
         async def react_message(event: Any, message_id: str, reaction: str) -> str:
             """仅对当前快照中可见的消息添加表情回应。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
             if (
-                self._target_message_in_snapshot(flow_id, message_id, snapshot_seq)
+                self._target_message_in_snapshot(
+                    flow_id,
+                    message_id,
+                    snapshot_seq,
+                    batch_id,
+                )
                 is None
             ):
                 return _json(
@@ -335,7 +325,8 @@ class ToolRuntime:
         async def poke_user(event: Any, user_id: str) -> str:
             """仅戳当前冻结快照中已出现的 QQ 用户。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
-            if not self._user_in_snapshot(flow_id, user_id, snapshot_seq):
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
+            if not self._user_in_snapshot(flow_id, user_id, snapshot_seq, batch_id):
                 return _json(
                     {
                         "success": False,
@@ -360,7 +351,13 @@ class ToolRuntime:
         async def get_message(event: Any, message_id: str) -> str:
             """读取一条持久化消息，同时遵守快照边界。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
-            record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
+            record = self._message_in_snapshot(
+                flow_id,
+                message_id,
+                snapshot_seq,
+                batch_id,
+            )
             return _json(
                 record
                 or {
@@ -374,7 +371,13 @@ class ToolRuntime:
         ) -> str | CallToolResult:
             """读取一条快照消息中的原图。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
-            record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
+            record = self._message_in_snapshot(
+                flow_id,
+                message_id,
+                snapshot_seq,
+                batch_id,
+            )
             if record is None:
                 return _json(
                     {
@@ -450,7 +453,13 @@ class ToolRuntime:
         async def get_image_captions(event: Any, message_id: str) -> str:
             """读取一条快照消息中的图片转述。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
-            record = self._message_in_snapshot(flow_id, message_id, snapshot_seq)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
+            record = self._message_in_snapshot(
+                flow_id,
+                message_id,
+                snapshot_seq,
+                batch_id,
+            )
             if record is None:
                 return _json(
                     {
@@ -524,8 +533,9 @@ class ToolRuntime:
             until: int | None = None,
             limit: int = 20,
         ) -> str:
-            """搜索本地群历史，结果上限为本轮快照序号。"""
+            """搜索当前冻结 Buffer batch；已确认的 QQ 历史由独立工具提供。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
             messages = self.store.search_records(
                 flow_id,
                 query=query,
@@ -534,6 +544,7 @@ class ToolRuntime:
                 until=until,
                 max_seq=snapshot_seq,
                 limit=limit,
+                batch_id=batch_id or None,
             )
             return _json({"messages": messages})
 
@@ -591,13 +602,13 @@ class ToolRuntime:
                 ),
                 FunctionTool(
                     name="poke_user",
-                    description="Poke one QQ user observed in the available chat history.",
+                    description="Poke one QQ user observed in the current frozen message set.",
                     parameters={
                         "type": "object",
                         "properties": {
                             "user_id": {
                                 "type": "string",
-                                "description": "Exact QQ user ID observed as a sender, mention, or poke target in the available chat history.",
+                                "description": "Exact QQ user ID observed as a sender, mention, or poke target in the current frozen message set.",
                             }
                         },
                         "required": ["user_id"],
@@ -627,7 +638,10 @@ class ToolRuntime:
                 ),
                 FunctionTool(
                     name="search_chat_history",
-                    description="Search locally stored history for the current group.",
+                    description=(
+                        "Search messages in the current frozen Buffer snapshot; "
+                        "historical QQ search is provided separately."
+                    ),
                     parameters={
                         "type": "object",
                         "properties": {

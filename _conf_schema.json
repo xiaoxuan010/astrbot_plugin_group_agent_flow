@@ -63,8 +63,8 @@
       },
       "max_log_records": {
         "type": "int",
-        "description": "Maximum persisted records per group",
-        "hint": "0 disables retention trimming.",
+        "description": "Maximum pending and inflight Buffer records per group",
+        "hint": "0 disables the Buffer capacity limit; acknowledged message bodies are deleted.",
         "default": 10000
       },
       "max_text_chars": {
@@ -80,8 +80,8 @@
       },
       "record_empty_messages": {
         "type": "bool",
-        "description": "Record messages with no text or components",
-        "hint": "Contentless transport events are retained for diagnostics and skipped before model inference.",
+        "description": "Legacy compatibility flag for contentless-event diagnostics",
+        "hint": "Contentless transport events are never written to the SQLite Buffer or sent to the model.",
         "default": true
       }
     }

@@ -1,5 +1,15 @@
 # Error Handling
 
+## Current SQLite Buffer Contract
+
+The active runtime stores only pending/inflight `group_message` Buffer rows. A rejected
+`agent_action` Buffer write is an explicit programming/configuration error, while a
+successful external action is represented in the current run event extras and Core
+conversation history rather than a local action-fact row. Batch acknowledgement is
+driven by Core's internal `_checkpoint`; missing confirmation requeues the inflight rows.
+The older action-fact persistence requirements below are legacy context and do not apply
+to the SQLite Buffer implementation.
+
 ## Model-Visible Tool Errors
 
 Read-only tools and validation failures return compact JSON strings. Expected failures use a

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from sys import maxsize
@@ -20,6 +21,9 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .agent_tools import (
+    BATCH_ID_EXTRA,
+    BATCH_RECORDS_EXTRA,
+    CHECKPOINT_ID_EXTRA,
     FLOW_ID_EXTRA,
     PLUGIN_NAME,
     RUN_GENERATION_EXTRA,
@@ -30,7 +34,7 @@ from .agent_tools import (
 )
 from .coordinator import GroupRunCoordinator
 from .event_codec import extract_group_event
-from .observation import prepare_observation
+from .observation import prepare_observation_records
 from .qq_gateway import QQActionGateway
 from .response_policy import (
     EXTERNAL_ACTIONS_EXTRA,
@@ -41,12 +45,14 @@ from .response_policy import (
     suppress_builtin_active_reply,
     suppress_direct_output,
 )
-from .store import GroupFlowStore
+from .store import (
+    ActiveBatchError,
+    BufferCapacityError,
+    GroupFlowStore,
+)
 
 
-LEGACY_PLUGIN_NAME = "astrbot_plugin_group_context_flow"
 AUTONOMOUS_EXTRA = "_group_agent_autonomous"
-PENDING_CURSOR_EXTRA = "_group_agent_pending_cursor"
 
 AGENT_PROTOCOL_PROMPT = """
 You are an autonomous participant in a QQ group chat.
@@ -118,9 +124,9 @@ CONFIG_DEFAULTS = {
 
 
 def _external_action_outcome_detail(actions: list[dict[str, Any]]) -> str:
-    """保存动作名，并只附带插件生成的安全持久化诊断。"""
+    """在 debug 日志中保留动作名和安全的运行诊断。"""
     parts: list[str] = []
-    safe_prefixes = ("fact_encode_failed:", "fact_persist_failed:")
+    safe_prefixes = ("stale_run",)
     for action in actions:
         action_name = str(action.get("action_name") or "")
         detail = str(action.get("detail") or "")
@@ -146,7 +152,6 @@ class GroupAgentFlowPlugin(Star):
             self.store,
             QQActionGateway(),
             terminal_callback=self._finalize_terminal_observation,
-            action_persist_callback=self._persist_agent_action,
             action_admission_callback=self._admit_external_action,
             context=self.context,
         )
@@ -181,37 +186,15 @@ class GroupAgentFlowPlugin(Star):
         )
 
     async def initialize(self) -> None:
-        """执行一次旧数据迁移，并记录当前存储目录。"""
-        legacy_dir = Path(get_astrbot_data_path()) / "plugin_data" / LEGACY_PLUGIN_NAME
-        migrated = self.store.import_legacy_data(legacy_dir)
-        migration_text = " legacy-data-migrated" if migrated else ""
+        """校验插件数据库，并明确保留旧 JSONL 作为只读材料。"""
         logger.info(
-            f"[{PLUGIN_NAME}] loaded data_dir={self.store.base_dir}{migration_text}"
+            f"[{PLUGIN_NAME}] loaded sqlite_buffer={self.store.db_path} "
+            "legacy_jsonl=preserved"
         )
 
     def _lock_for(self, flow_id: str) -> asyncio.Lock:
         """返回群级锁，串行化同一群流水的文件修改。"""
         return self._locks.setdefault(flow_id, asyncio.Lock())
-
-    async def _persist_agent_action(
-        self,
-        flow_id: str,
-        record: dict[str, Any],
-        *,
-        run_id: str,
-        generation: int,
-    ) -> int:
-        """写入动作事实，并将其纳入已经存在的下一快照。"""
-        async with self._lock_for(flow_id):
-            if not self.coordinator.is_run_current(
-                run_id,
-                flow_id=flow_id,
-                generation=generation,
-            ):
-                raise RuntimeError("stale autonomous group run")
-            seq = self.store.append_record(flow_id, record)
-            self.coordinator.include_pending_seq(flow_id, seq)
-            return seq
 
     async def _admit_external_action(
         self,
@@ -258,16 +241,30 @@ class GroupAgentFlowPlugin(Star):
             event,
             max_text_chars=int(self._cfg("max_text_chars", 4000) or 0),
         )
-        if (
-            not record["text"]
-            and not record["components"]
-            and not bool(self._cfg("record_empty_messages", True))
-        ):
+        if not record["text"] and not record["components"]:
+            if bool(self._cfg("debug_log", False)):
+                logger.debug(
+                    f"[{PLUGIN_NAME}] skipped contentless group event "
+                    f"message_id={record.get('message_id', '')}"
+                )
             return None
         flow_id = str(record["flow_id"])
         directed = bool(record["is_directed_at_bot"] or event.is_at_or_wake_command)
         async with self._lock_for(flow_id):
-            seq = self.store.append_record(flow_id, record)
+            try:
+                append_pending = getattr(self.store, "append_pending", None)
+                if append_pending is None:
+                    seq = int(self.store.append_record(flow_id, record))
+                    inserted = True
+                else:
+                    appended = append_pending(flow_id, record)
+                    seq = int(appended.seq)
+                    inserted = bool(appended.inserted)
+            except BufferCapacityError as exc:
+                logger.warning(f"[{PLUGIN_NAME}] {exc}")
+                return None
+            if not inserted:
+                return None
             if schedule:
                 self.coordinator.enqueue(
                     flow_id,
@@ -293,6 +290,52 @@ class GroupAgentFlowPlugin(Star):
             event.unified_msg_origin,
             conversation_id,
             create_if_not_exists=True,
+        )
+
+    @staticmethod
+    def _conversation_history(conversation: Any) -> list[dict[str, Any]]:
+        raw_history = getattr(conversation, "history", [])
+        if isinstance(raw_history, str):
+            try:
+                raw_history = json.loads(raw_history) if raw_history else []
+            except json.JSONDecodeError:
+                return []
+        if not isinstance(raw_history, list):
+            return []
+        return [item for item in raw_history if isinstance(item, dict)]
+
+    @classmethod
+    def _checkpoint_count(cls, conversation: Any, checkpoint_id: str) -> int:
+        if not checkpoint_id:
+            return 0
+        count = 0
+        for item in cls._conversation_history(conversation):
+            if str(item.get("role") or "") != "_checkpoint":
+                continue
+            content = item.get("content")
+            if isinstance(content, dict) and str(content.get("id") or "") == checkpoint_id:
+                count += 1
+        return count
+
+    @staticmethod
+    def _existing_checkpoint_id(event: AstrMessageEvent) -> str:
+        return str(event.get_extra("llm_checkpoint_id", "") or "")
+
+    def _reconcile_inflight(self, flow_id: str, conversation: Any) -> None:
+        counts: dict[str, int] = {}
+        for item in self._conversation_history(conversation):
+            if str(item.get("role") or "") != "_checkpoint":
+                continue
+            content = item.get("content")
+            if not isinstance(content, dict):
+                continue
+            checkpoint_id = str(content.get("id") or "")
+            if checkpoint_id:
+                counts[checkpoint_id] = counts.get(checkpoint_id, 0) + 1
+        self.store.reconcile_inflight(
+            flow_id,
+            counts,
+            requeue_unconfirmed=True,
         )
 
     def _system_prompt(self) -> str:
@@ -341,7 +384,6 @@ class GroupAgentFlowPlugin(Star):
             event.set_extra(AUTONOMOUS_EXTRA, True)
             event.set_extra(RUN_ID_EXTRA, snapshot.run_id)
             event.set_extra(FLOW_ID_EXTRA, snapshot.flow_id)
-            event.set_extra(SNAPSHOT_SEQ_EXTRA, snapshot.snapshot_seq)
             event.set_extra(RUN_GENERATION_EXTRA, snapshot.generation)
             event.set_extra("enable_streaming", False)
             isolate_platform_metadata(event)
@@ -351,6 +393,34 @@ class GroupAgentFlowPlugin(Star):
                 if conversation is None:
                     logger.error(f"[{PLUGIN_NAME}] failed to create conversation")
                     return
+                async with self._lock_for(flow_id):
+                    self._reconcile_inflight(flow_id, conversation)
+                    checkpoint_id = self._existing_checkpoint_id(event)
+                    checkpoint_baseline = self._checkpoint_count(
+                        conversation,
+                        checkpoint_id,
+                    )
+                    try:
+                        batch = self.store.claim_batch(
+                            flow_id,
+                            snapshot.snapshot_seq,
+                            checkpoint_id=checkpoint_id or None,
+                            checkpoint_baseline_count=checkpoint_baseline,
+                        )
+                    except ActiveBatchError:
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] active batch prevented new claim "
+                            f"flow_id={flow_id}"
+                        )
+                        return
+                    if batch is None:
+                        return
+                    if not checkpoint_id:
+                        event.set_extra("llm_checkpoint_id", batch.checkpoint_id)
+                    event.set_extra(BATCH_ID_EXTRA, batch.batch_id)
+                    event.set_extra(BATCH_RECORDS_EXTRA, list(batch.records))
+                    event.set_extra(CHECKPOINT_ID_EXTRA, batch.checkpoint_id)
+                    event.set_extra(SNAPSHOT_SEQ_EXTRA, batch.snapshot_seq)
                 # yield 后由 AstrBot 原生 Agent/工具循环接管执行。
                 yield event.request_llm(
                     prompt=OBSERVATION_CYCLE_PROMPT,
@@ -366,7 +436,7 @@ class GroupAgentFlowPlugin(Star):
 
     @filter.on_llm_request(priority=maxsize - 20)
     async def inject_snapshot(self, event: AstrMessageEvent, req: ProviderRequest):
-        """注入持久化 observation 增量并续算上下文 token 基线。"""
+        """注入当前已领取 batch，不读取已确认的历史正文。"""
         if not event.get_extra(AUTONOMOUS_EXTRA, False) or not req.conversation:
             return
         flow_id = str(event.get_extra(FLOW_ID_EXTRA, "") or "")
@@ -374,9 +444,12 @@ class GroupAgentFlowPlugin(Star):
         run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
         generation = int(event.get_extra(RUN_GENERATION_EXTRA, -1) or 0)
         default_renderer = str(self._cfg("context_renderer", "legacy_delta"))
-        history_cursor = self.store.get_history_cursor(flow_id, req.conversation.cid)
-        if history_cursor is None:
-            req.contexts = []
+        batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
+        records = event.get_extra(BATCH_RECORDS_EXTRA, [])
+        if not isinstance(records, list) and batch_id:
+            records = self.store.get_batch_records(batch_id)
+        if not isinstance(records, list):
+            records = []
         async with self._lock_for(flow_id):
             if not self.coordinator.is_run_current(
                 run_id,
@@ -385,52 +458,18 @@ class GroupAgentFlowPlugin(Star):
             ):
                 event.stop_event()
                 return
-            # 当前配置在下一轮请求生效；已写入 Core 的多角色历史保持原始形态。
-            renderer_name = self.store.get_or_assign_renderer(
-                flow_id,
-                req.conversation.cid,
-                default_renderer,
-            )
-            prepared = prepare_observation(
-                self.store,
-                flow_id=flow_id,
+            prepared = prepare_observation_records(
+                records,
                 snapshot_seq=snapshot_seq,
-                renderer_name=renderer_name,
+                renderer_name=default_renderer,
                 max_context_tokens=int(self._cfg("max_context_tokens", 8192) or 0),
-                history_cursor=history_cursor,
             )
-            if history_cursor is None:
-                req.conversation.token_usage = 0
-            else:
-                req.conversation.token_usage = (
-                    req.conversation.token_usage or 0
-                ) + prepared.estimated_tokens
-            pending = {
-                "flow_id": flow_id,
-                "conversation_id": req.conversation.cid,
-                "target_seq": prepared.target_cursor,
-                "count": len(prepared.source_seqs),
-                "skipped": prepared.skipped_count,
-                "estimated_tokens": prepared.estimated_tokens,
-                "history_cursor": prepared.target_cursor,
-            }
-            event.set_extra(PENDING_CURSOR_EXTRA, pending)
+            req.conversation.token_usage = (
+                req.conversation.token_usage or 0
+            ) + prepared.estimated_tokens
             if not prepared.source_seqs:
-                run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
-                if run_id:
-                    self.store.record_run_outcome(
-                        run_id,
-                        flow_id=flow_id,
-                        snapshot_seq=snapshot_seq,
-                        outcome="empty_snapshot_skipped",
-                    )
-                self.store.commit_observation(
-                    flow_id,
-                    req.conversation.cid,
-                    prepared.target_cursor,
-                    unified_msg_origin=event.unified_msg_origin,
-                    history_cursor=prepared.target_cursor,
-                )
+                if batch_id:
+                    self.store.requeue_batch(batch_id)
         if not prepared.source_seqs:
             if bool(self._cfg("debug_log", False)):
                 logger.debug(
@@ -444,7 +483,9 @@ class GroupAgentFlowPlugin(Star):
         req.func_tool = self.tool_runtime.build_tool_set(event)
         if bool(self._cfg("debug_log", False)):
             logger.debug(
-                f"[{PLUGIN_NAME}] prepared snapshot {event.get_extra(PENDING_CURSOR_EXTRA)}"
+                f"[{PLUGIN_NAME}] prepared batch "
+                f"{event.get_extra(BATCH_ID_EXTRA, '')} "
+                f"snapshot={snapshot_seq}"
             )
 
     @filter.on_llm_request(priority=-maxsize + 20)
@@ -459,7 +500,7 @@ class GroupAgentFlowPlugin(Star):
 
     @filter.on_llm_response(priority=-maxsize + 20)
     async def finalize_observation(self, event: AstrMessageEvent, resp: LLMResponse):
-        """抑制直接输出，记录本轮结果，并提交已消费 cursor。"""
+        """抑制直接输出并记录本轮运行结果；Buffer 由 Core checkpoint 确认。"""
         if not event.get_extra(AUTONOMOUS_EXTRA, False):
             return
         had_direct_output = bool(getattr(resp, "completion_text", ""))
@@ -483,7 +524,7 @@ class GroupAgentFlowPlugin(Star):
         *,
         had_direct_output: bool,
     ) -> None:
-        """持久化本轮结果并推进已消费快照的 cursor。"""
+        """记录运行诊断；Buffer 只由 Core checkpoint reconciliation 确认。"""
         run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
         flow_id = str(event.get_extra(FLOW_ID_EXTRA, "") or "")
         snapshot_seq = int(event.get_extra(SNAPSHOT_SEQ_EXTRA, 0) or 0)
@@ -491,7 +532,6 @@ class GroupAgentFlowPlugin(Star):
         external_actions = event.get_extra(EXTERNAL_ACTIONS_EXTRA, [])
         if not isinstance(external_actions, list):
             external_actions = []
-        pending = event.get_extra(PENDING_CURSOR_EXTRA, {})
         async with self._lock_for(flow_id):
             if not self.coordinator.is_run_current(
                 run_id,
@@ -499,7 +539,7 @@ class GroupAgentFlowPlugin(Star):
                 generation=generation,
             ):
                 return
-            if run_id:
+            if run_id and bool(self._cfg("debug_log", False)):
                 outcome = classify_run_outcome(
                     external_actions,
                     silence_selected=bool(
@@ -507,21 +547,10 @@ class GroupAgentFlowPlugin(Star):
                     ),
                     had_direct_output=had_direct_output,
                 )
-                self.store.record_run_outcome(
-                    run_id,
-                    flow_id=flow_id,
-                    snapshot_seq=snapshot_seq,
-                    outcome=outcome,
-                    detail=_external_action_outcome_detail(external_actions),
-                )
-            if isinstance(pending, dict) and pending.get("conversation_id"):
-                # 收到响应后再推进 cursor，避免失败请求导致消息丢失。
-                self.store.commit_observation(
-                    flow_id,
-                    str(pending["conversation_id"]),
-                    int(pending.get("target_seq") or snapshot_seq),
-                    unified_msg_origin=event.unified_msg_origin,
-                    history_cursor=int(pending.get("history_cursor") or snapshot_seq),
+                logger.info(
+                    f"[{PLUGIN_NAME}] run={run_id} flow={flow_id} "
+                    f"snapshot={snapshot_seq} outcome={outcome} "
+                    f"actions={_external_action_outcome_detail(external_actions)}"
                 )
 
     @filter.on_agent_begin(priority=maxsize - 20)
@@ -554,7 +583,7 @@ class GroupAgentFlowPlugin(Star):
 
     @filter.command("gaf_status")
     async def group_agent_status(self, event: AstrMessageEvent):
-        """显示群流水与会话 cursor 的持久化统计信息。"""
+        """显示群流水 Buffer 与活动 batch 的持久化统计信息。"""
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
             yield event.plain_result("gaf_status only supports group chats.")
             return
@@ -572,8 +601,11 @@ class GroupAgentFlowPlugin(Star):
             f"flow_id: {flow_id}\n"
             f"conversation_id: {conversation_id or 'N/A'}\n"
             f"records: {stats['records']}\n"
+            f"pending: {stats['pending']}\n"
+            f"inflight: {stats['inflight']}\n"
             f"latest_seq: {stats['latest_seq']}\n"
-            f"cursor: {stats['cursor']}"
+            f"next_seq: {stats['next_seq']}\n"
+            f"active_batch: {stats['active_batch'] or 'N/A'}"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)

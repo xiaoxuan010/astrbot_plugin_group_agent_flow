@@ -63,7 +63,7 @@ async def test_inject_snapshot_only_projects_claimed_rows(tmp_path):
 
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
     plugin.store = store
-    plugin.config = {"context": {"renderer": "plain_lines"}}
+    plugin.config = {"context": {"max_context_tokens": 8192}}
     plugin._locks = {}
     plugin.coordinator = SimpleNamespace(
         is_run_current=lambda *_args, **_kwargs: True,
@@ -91,6 +91,9 @@ async def test_inject_snapshot_only_projects_claimed_rows(tmp_path):
     assert len(request.contexts) == 2
     assert "first" in request.contexts[-1]["content"]
     assert "second" in request.contexts[-1]["content"]
+    assert request.contexts[-1]["content"].startswith(
+        '<group_messages_delta group_id="1">'
+    )
     assert batch.batch_id not in json.dumps(request.contexts)
     assert request.func_tool == "tools"
 

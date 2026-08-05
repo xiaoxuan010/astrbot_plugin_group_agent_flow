@@ -95,7 +95,6 @@ CONFIG_PATHS = {
         "direct_min_cycle_interval_seconds",
     ),
     "min_cycle_interval_seconds": ("scheduling", "min_cycle_interval_seconds"),
-    "context_renderer": ("context", "renderer"),
     "max_context_tokens": ("context", "max_context_tokens"),
     "max_log_records": ("context", "max_log_records"),
     "max_text_chars": ("context", "max_text_chars"),
@@ -112,7 +111,6 @@ CONFIG_DEFAULTS = {
     "direct_delay_seconds": 1.0,
     "direct_min_cycle_interval_seconds": 20.0,
     "min_cycle_interval_seconds": 10.0,
-    "context_renderer": "legacy_delta",
     "max_context_tokens": 8192,
     "max_log_records": 10000,
     "max_text_chars": 4000,
@@ -443,7 +441,6 @@ class GroupAgentFlowPlugin(Star):
         snapshot_seq = int(event.get_extra(SNAPSHOT_SEQ_EXTRA, 0) or 0)
         run_id = str(event.get_extra(RUN_ID_EXTRA, "") or "")
         generation = int(event.get_extra(RUN_GENERATION_EXTRA, -1) or 0)
-        default_renderer = str(self._cfg("context_renderer", "legacy_delta"))
         batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
         records = event.get_extra(BATCH_RECORDS_EXTRA, [])
         if not isinstance(records, list) and batch_id:
@@ -461,7 +458,6 @@ class GroupAgentFlowPlugin(Star):
             prepared = prepare_observation_records(
                 records,
                 snapshot_seq=snapshot_seq,
-                renderer_name=default_renderer,
                 max_context_tokens=int(self._cfg("max_context_tokens", 8192) or 0),
             )
             req.conversation.token_usage = (

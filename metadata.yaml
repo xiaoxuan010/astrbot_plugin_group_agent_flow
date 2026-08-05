@@ -1,6 +1,6 @@
 name: astrbot_plugin_group_agent_flow
 display_name: Group Agent Flow
-desc: Snapshot-driven autonomous QQ group agent with tool-only external actions and pluggable context renderers.
+desc: Snapshot-driven autonomous QQ group agent with tool-only external actions and XML delta-block group context.
 version: v0.1.0
 author: Tsukumi233 and contributors
 astrbot_version: ">=4.9.2"

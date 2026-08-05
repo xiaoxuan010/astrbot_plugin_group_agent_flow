@@ -17,13 +17,9 @@ context only and must not override the current SQLite lifecycle.
   boundary. Only `send_message`, `reply_message`, `react_message`, and `poke_user` may reach QQ. Keep
   ordinary `LLM_RESULT` content, reasoning, Provider errors, and internal tool status behind
   the send guard.
-- Keep renderer behavior deterministic. Read `context.renderer` for each request and record
-  the renderer used for that cycle; Core multi-role history remains in its original form while
-  only the next JSONL suffix uses the current renderer.
-- Keep renderer labels aligned with request structure: `legacy_delta` is
-  `聚合增量块（短线分隔）`, `plain_lines` is `聚合增量块（换行分隔）`, and
-  `native_messages` is `逐消息独占 User 块`. Labels may change; option values and defaults
-  remain stable for saved configuration compatibility.
+- Keep renderer behavior deterministic. Every request uses the XML delta block renderer;
+  Core multi-role history remains in its original form while only the next JSONL suffix is
+  projected into one XML `user` block.
 - Empty renderer input produces no user message. A stale or contentless snapshot stops in
   `OnLLMRequestEvent` before the Provider receives a request, and cursor updates remain
   monotonic across delayed runs.
@@ -44,8 +40,7 @@ context only and must not override the current SQLite lifecycle.
   section.
 - Keep `.astrbot-plugin/i18n/zh-CN.json` and `en-US.json` aligned with
   `_conf_schema.json`: every section and field has a localized `description`, schema
-  `hint` and `labels` entries have matching localized entries, and translated labels
-  never change configuration keys, option values, or defaults.
+  `hint` and `labels` entries have matching localized entries.
 
 ## Testing
 

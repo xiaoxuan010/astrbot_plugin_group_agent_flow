@@ -26,7 +26,6 @@ def _prepare(
     store: GroupFlowStore,
     *,
     snapshot_seq: int,
-    renderer_name: str = "plain_lines",
     max_context_tokens: int = 8192,
     history_cursor: int | None = None,
 ):
@@ -34,7 +33,6 @@ def _prepare(
         store,
         flow_id=FLOW_ID,
         snapshot_seq=snapshot_seq,
-        renderer_name=renderer_name,
         max_context_tokens=max_context_tokens,
         history_cursor=history_cursor,
     )
@@ -50,19 +48,14 @@ def test_observation_rebuilds_from_current_buffer_rows(tmp_path):
     for index in range(1, 5):
         store.append_pending(FLOW_ID, _record(f"m{index}", f"message {index}"))
 
-    prepared = _prepare(
-        store,
-        snapshot_seq=4,
-        renderer_name="native_messages",
-    )
+    prepared = _prepare(store, snapshot_seq=4)
 
     assert prepared.source_seqs == (1, 2, 3, 4)
-    assert [message["content"].split("] ")[-1] for message in prepared.contexts] == [
-        "message 1",
-        "message 2",
-        "message 3",
-        "message 4",
-    ]
+    assert len(prepared.contexts) == 1
+    assert all(
+        f">message {index}</text>" in prepared.contexts[0]["content"]
+        for index in range(1, 5)
+    )
     assert prepared.target_cursor == 4
 
 
@@ -77,11 +70,7 @@ def test_existing_history_cursor_selects_only_the_new_suffix(tmp_path):
     assert "latest" in prepared.contexts[0]["content"]
 
 
-@pytest.mark.parametrize(
-    "renderer_name",
-    ["legacy_delta", "plain_lines", "native_messages"],
-)
-def test_existing_history_cursor_renders_only_the_new_suffix(tmp_path, renderer_name):
+def test_existing_history_cursor_renders_only_the_new_suffix(tmp_path):
     store = GroupFlowStore(tmp_path)
     store.append_pending(FLOW_ID, _record("m1", "first"))
     store.append_pending(FLOW_ID, _record("m2", "second"))
@@ -89,7 +78,6 @@ def test_existing_history_cursor_renders_only_the_new_suffix(tmp_path, renderer_
     prepared = _prepare(
         store,
         snapshot_seq=2,
-        renderer_name=renderer_name,
         history_cursor=1,
     )
 
@@ -123,17 +111,16 @@ def test_single_oversized_message_keeps_metadata_tail_and_lookup_marker(tmp_path
     prepared = _prepare(
         store,
         snapshot_seq=1,
-        renderer_name="plain_lines",
         max_context_tokens=240,
     )
 
     assert prepared.source_seqs == (1,)
     assert prepared.estimated_tokens <= 240
     content = prepared.contexts[0]["content"]
-    assert "msg=oversized" in content
+    assert 'message_id="oversized"' in content
     assert "内容已截断" in content
     assert "get_message" in content
-    assert content.endswith("-TAIL")
+    assert "-TAIL</text>" in content
     assert "BEGIN-" not in content
     assert store.get_message(FLOW_ID, "oversized")["text"] == original
 
@@ -146,7 +133,6 @@ def test_impossibly_small_token_budget_fails_instead_of_exceeding_limit(tmp_path
         _prepare(
             store,
             snapshot_seq=1,
-            renderer_name="plain_lines",
             max_context_tokens=1,
         )
 
@@ -169,7 +155,6 @@ def test_prepare_observation_ignores_transport_events_without_model_content(tmp_
     prepared = _prepare(
         store,
         snapshot_seq=1,
-        renderer_name="legacy_delta",
     )
 
     assert prepared.contexts == ()

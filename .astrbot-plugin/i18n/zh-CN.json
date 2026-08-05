@@ -1,7 +1,7 @@
 {
   "metadata": {
     "display_name": "群聊自主智能体 Flow",
-    "desc": "基于固定快照驱动的 QQ 群聊自主智能体，所有对外动作均通过工具调用，并支持可切换的上下文渲染格式。"
+    "desc": "基于固定快照驱动的 QQ 群聊自主智能体，所有对外动作均通过工具调用，并使用 XML 增量块传递群聊上下文。"
   },
   "config": {
     "agent_settings": {
@@ -31,11 +31,6 @@
     },
     "context": {
       "description": "上下文与持久化",
-      "renderer": {
-        "description": "新会话上下文渲染格式",
-        "hint": "聚合增量块（短线分隔）：单个 User 块，使用 <group_messages_delta> 包装并以 --- 分隔事件；聚合增量块（换行分隔）：单个 User 块，以换行分隔结构化事件；逐消息独占 User 块：每个群事件分别生成一条 role=user 消息；XML 增量块（结构化组件）：单个 <group_messages_delta>，外层携带群元数据，内部按 XML 组件表达事件。",
-        "labels": ["聚合增量块（短线分隔）", "聚合增量块（换行分隔）", "逐消息独占 User 块", "XML 增量块（结构化组件）"]
-      },
       "max_context_tokens": {
         "description": "观察上下文最大 token 数",
         "hint": "使用 AstrBot Core 的 token 计数器。最新观察块单独超限时会优先裁剪其中的旧记录；更早记录仍可通过历史工具检索。"

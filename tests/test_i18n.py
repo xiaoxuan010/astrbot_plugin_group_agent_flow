@@ -39,17 +39,15 @@ def test_plugin_i18n_covers_metadata_and_configuration_schema():
                     )
 
 
-def test_renderer_values_and_default_remain_stable():
-    renderer = _load_json(ROOT / "_conf_schema.json")["context"]["items"][
-        "renderer"
-    ]
-    assert renderer["options"] == [
-        "legacy_delta",
-        "plain_lines",
-        "native_messages",
-        "xml_delta",
-    ]
-    assert renderer["default"] == "legacy_delta"
+def test_context_renderer_is_not_user_configurable():
+    schema = _load_json(ROOT / "_conf_schema.json")
+    assert "renderer" not in schema["context"]["items"]
+
+    for locale in LOCALES:
+        resource = _load_json(
+            ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
+        )
+        assert "renderer" not in resource["config"]["context"]
 
 
 def test_context_window_uses_token_budget_and_cache_retention_settings():
@@ -77,27 +75,3 @@ def test_directed_cycle_interval_schema_contract():
             "direct_min_cycle_interval_seconds"
         ]
         assert localized["description"]
-
-
-def test_renderer_labels_describe_the_actual_message_structure():
-    schema = _load_json(ROOT / "_conf_schema.json")
-    renderer = schema["context"]["items"]["renderer"]
-    zh = _load_json(ROOT / ".astrbot-plugin" / "i18n" / "zh-CN.json")
-    en = _load_json(ROOT / ".astrbot-plugin" / "i18n" / "en-US.json")
-
-    assert renderer["labels"] == [
-        "Aggregated Delta Block (Dash-separated)",
-        "Aggregated Delta Block (Line-separated)",
-        "Dedicated User Block per Message",
-        "XML Delta Block (Structured Components)",
-    ]
-    assert zh["config"]["context"]["renderer"]["labels"] == [
-        "聚合增量块（短线分隔）",
-        "聚合增量块（换行分隔）",
-        "逐消息独占 User 块",
-        "XML 增量块（结构化组件）",
-    ]
-    assert en["config"]["context"]["renderer"]["labels"] == renderer["labels"]
-    assert "<group_messages_delta>" in zh["config"]["context"]["renderer"]["hint"]
-    assert "role=user" in zh["config"]["context"]["renderer"]["hint"]
-    assert "XML" in zh["config"]["context"]["renderer"]["hint"]

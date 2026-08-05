@@ -44,19 +44,12 @@ AstrBot 消息链或 NapCat `set_msg_emoji_like` API。自主运行期间的 Ast
 Agent 开始前会重新固定工具集，避免全局 web、shell、cron 或主动发送工具绕过插件的动作边界。
 运维指令仍由 AstrBot 命令处理。
 
-## 上下文实验
+## 上下文格式
 
-`context.renderer` 支持三种投影：
-
-- 聚合增量块（短线分隔，`legacy_delta`）：生成一个 User 块，使用 `<group_messages_delta>` 包装，消息之间以 `---` 分隔。
-- 聚合增量块（换行分隔，`plain_lines`）：生成一个 User 块，每条群消息占一行，包含发送者、时间和消息 ID。
-- 逐消息独占 User 块（`native_messages`）：每条群消息分别生成一条 `role=user` 消息，保留模型请求中的消息边界。
-- XML 增量块（结构化组件，`xml_delta`）：生成一个 User 块，使用 `<group_messages_delta>` 在外层传递群号和群名，内部以 XML 表达消息、机器人动作、引用、提及、文本和媒体组件。
-
-四个 option value 为兼容已保存配置保持不变。`---` 是人为分隔协议，提供比普通换行更明显的
-记录边界；仓库中尚无模型评测能确定最优格式。修改 `context.renderer` 后，同一群聊的下一轮请求
-立即采用新投影格式；已进入 AstrBot Core 会话的 `user`、`assistant`、`tool` 原始历史及 reasoning
-保持原样，SQLite 只投影尚未交给 Core 的当前 batch 记录。
+群聊增量始终使用 XML 增量块（`xml_delta`）：生成一个 User 块，使用
+`<group_messages_delta>` 在外层传递群号和群名，内部以 XML 表达消息、机器人动作、引用、提及、文本
+和媒体组件。该格式固定，不再提供上下文渲染格式配置项；已进入 AstrBot Core 会话的 `user`、`assistant`、
+`tool` 原始历史及 reasoning 保持原样，SQLite 只投影尚未交给 Core 的当前 batch 记录。
 
 观察请求保留 AstrBot Core 的多角色 conversation history，只追加当前 SQLite batch 的群事实，并把
 估算量追加到 Core 的 token usage 基线。`max_context_tokens` 默认 8192，使用 AstrBot Core

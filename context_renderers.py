@@ -1,4 +1,4 @@
-"""将持久化群事件投影为 LLM 消息的可插拔 renderer。"""
+"""将持久化群事件投影为固定的 XML 增量块。"""
 
 from __future__ import annotations
 
@@ -34,48 +34,6 @@ def format_group_timestamp(timestamp: Any, *, strict: bool = False) -> str:
 def _is_agent_action(event: dict[str, Any]) -> bool:
     """识别插件生成的机器人动作事实。"""
     return _one_line(event.get("record_kind")) == "agent_action"
-
-
-def _agent_action_line(event: dict[str, Any]) -> str:
-    """渲染不可作为 QQ 消息目标的机器人动作事实。"""
-    fields = [
-        "QQ",
-        f"group={_one_line(event.get('group_id'))}",
-        "actor=bot",
-        f"action={_one_line(event.get('action_name'))}",
-        f"status={_one_line(event.get('action_status'))}",
-        f"action_id={_one_line(event.get('message_id'))}",
-        f"time={format_group_timestamp(event.get('timestamp'))}",
-    ]
-    target_message_id = _one_line(
-        event.get("target_message_id") or event.get("reply_to")
-    )
-    if target_message_id:
-        fields.append(f"target_msg={target_message_id}")
-    target_user_id = _one_line(event.get("target_user_id"))
-    if target_user_id:
-        fields.append(f"target_user={target_user_id}")
-    text = _one_line(event.get("text")) or "[动作]"
-    return f"[{' '.join(fields)}] {text}"
-
-
-def _structured_line(event: dict[str, Any]) -> str:
-    """将一条事件渲染为带稳定路由和归属信息的文本行。"""
-    if _is_agent_action(event):
-        return _agent_action_line(event)
-    fields = [
-        "QQ",
-        f"group={_one_line(event.get('group_id'))}",
-        f"msg={_one_line(event.get('message_id'))}",
-        f"sender={_one_line(event.get('sender_id'))}",
-        f"name={_one_line(event.get('sender_name'))}",
-        f"time={format_group_timestamp(event.get('timestamp'))}",
-    ]
-    reply_to = _one_line(event.get("reply_to"))
-    if reply_to:
-        fields.append(f"reply_to={reply_to}")
-    text = _one_line(event.get("text")) or "[消息]"
-    return f"[{' '.join(fields)}] {text}"
 
 
 def _xml_attrs(**values: Any) -> str:
@@ -182,48 +140,6 @@ class ContextRenderer(Protocol):
         ...
 
 
-class LegacyDeltaRenderer:
-    """使用单个聚合增量块和 `---` 消息分隔符。"""
-
-    name = "legacy_delta"
-
-    def render(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """将完整增量合并为一条兼容旧格式的 user 消息。"""
-        if not events:
-            return []
-        lines = []
-        for event in events:
-            if _is_agent_action(event):
-                lines.append(_agent_action_line(event))
-                continue
-            sender = _one_line(event.get("sender_name")) or _one_line(
-                event.get("sender_id")
-            )
-            timestamp = _datetime(event.get("timestamp")).strftime("%H:%M:%S")
-            message_id = _one_line(event.get("message_id"))
-            text = _one_line(event.get("text")) or "[消息]"
-            lines.append(f"[{sender}/{timestamp} msg={message_id}]: {text}")
-        body = "\n---\n".join(lines)
-        return [
-            {
-                "role": "user",
-                "content": f"<group_messages_delta>\n{body}\n</group_messages_delta>",
-            }
-        ]
-
-
-class PlainLinesRenderer:
-    """将结构化事件行合并为一个换行分隔的聚合增量块。"""
-
-    name = "plain_lines"
-
-    def render(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """使用换行分隔，不添加标签包装。"""
-        if not events:
-            return []
-        return [{"role": "user", "content": "\n".join(map(_structured_line, events))}]
-
-
 class XmlDeltaRenderer:
     """将事件组件投影为单个带群元数据的 XML 增量块。"""
 
@@ -245,27 +161,6 @@ class XmlDeltaRenderer:
         ]
 
 
-class NativeMessagesRenderer:
-    """将每条群事件映射为逐消息独占的 User 块。"""
-
-    name = "native_messages"
-
-    def render(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """通过独立请求消息保留原始事件边界。"""
-        return [{"role": "user", "content": _structured_line(event)} for event in events]
-
-
-_RENDERERS: dict[str, type[ContextRenderer]] = {
-    LegacyDeltaRenderer.name: LegacyDeltaRenderer,
-    PlainLinesRenderer.name: PlainLinesRenderer,
-    XmlDeltaRenderer.name: XmlDeltaRenderer,
-    NativeMessagesRenderer.name: NativeMessagesRenderer,
-}
-
-
-def build_renderer(name: str) -> ContextRenderer:
-    """创建指定 renderer，并拒绝未知的持久化名称。"""
-    renderer_type = _RENDERERS.get(name)
-    if renderer_type is None:
-        raise ValueError(f"unknown context renderer: {name}")
-    return renderer_type()
+def build_renderer() -> ContextRenderer:
+    """创建唯一支持的 XML 增量块 renderer。"""
+    return XmlDeltaRenderer()

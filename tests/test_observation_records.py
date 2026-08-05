@@ -16,7 +16,6 @@ def test_prepare_observation_records_uses_only_supplied_batch_rows():
             },
         ],
         snapshot_seq=9,
-        renderer_name="plain_lines",
         max_context_tokens=8192,
     )
 

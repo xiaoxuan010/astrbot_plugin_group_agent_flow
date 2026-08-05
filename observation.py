@@ -140,7 +140,6 @@ def prepare_observation(
     *,
     flow_id: str,
     snapshot_seq: int,
-    renderer_name: str,
     max_context_tokens: int,
     history_cursor: int | None = None,
 ) -> PreparedObservation:
@@ -149,7 +148,6 @@ def prepare_observation(
     return prepare_observation_records(
         all_records,
         snapshot_seq=snapshot_seq,
-        renderer_name=renderer_name,
         max_context_tokens=max_context_tokens,
         history_cursor=history_cursor,
     )
@@ -159,13 +157,12 @@ def prepare_observation_records(
     records: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     *,
     snapshot_seq: int,
-    renderer_name: str,
     max_context_tokens: int,
     history_cursor: int | None = None,
 ) -> PreparedObservation:
     """Render exactly the supplied immutable batch rows, without storage reads."""
     cursor = max(0, int(history_cursor)) if history_cursor is not None else 0
-    renderer = build_renderer(renderer_name)
+    renderer = build_renderer()
     counter = EstimateTokenCounter()
     hard_limit = max(1, int(max_context_tokens))
 

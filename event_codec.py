@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from typing import Any
 
@@ -78,6 +80,33 @@ def _raw_image_source_urls(event: Any) -> list[str]:
             url if url.startswith(("https://", "http://")) else ""
         )
     return source_urls
+
+
+def _synthetic_message_id(
+    *,
+    platform_id: str,
+    group_id: str,
+    sender_id: str,
+    timestamp: int,
+    message_seq: str,
+    outline: str,
+) -> str:
+    """生成不含聊天正文的稳定回退消息 ID。"""
+    identity = json.dumps(
+        {
+            "platform_id": platform_id,
+            "group_id": group_id,
+            "sender_id": sender_id,
+            "timestamp": timestamp,
+            "message_seq": message_seq,
+            "outline": outline,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"synthetic:{digest}"
 
 
 def _mention_records(mentions: Any) -> tuple[list[str], list[dict[str, Any]]]:
@@ -224,14 +253,21 @@ def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, 
 
     message_obj = event.message_obj
     timestamp = int(getattr(message_obj, "timestamp", 0) or time.time())
-    message_id = _value(getattr(message_obj, "message_id", ""))
-    if not message_id:
-        # 回退 ID 在同一适配器事件内保持稳定，可用于消息去重。
-        message_id = f"{event.get_sender_id()}:{timestamp}:{outline}"
-    group = getattr(message_obj, "group", None)
-    group_name = _value(getattr(group, "group_name", "")) if group else ""
     platform_id = _value(event.get_platform_id())
     group_id = _value(event.get_group_id())
+    sender_id = _value(event.get_sender_id())
+    message_id = _value(getattr(message_obj, "message_id", ""))
+    if not message_id:
+        message_id = _synthetic_message_id(
+            platform_id=platform_id,
+            group_id=group_id,
+            sender_id=sender_id,
+            timestamp=timestamp,
+            message_seq=message_seq,
+            outline=outline,
+        )
+    group = getattr(message_obj, "group", None)
+    group_name = _value(getattr(group, "group_name", "")) if group else ""
 
     record = {
         "schema_version": 2,
@@ -243,7 +279,7 @@ def extract_group_event(event: Any, *, max_text_chars: int = 4000) -> dict[str, 
         "flow_id": f"{platform_id}:group:{group_id}",
         "group_id": group_id,
         "group_name": group_name,
-        "sender_id": _value(event.get_sender_id()),
+        "sender_id": sender_id,
         "sender_name": _value(event.get_sender_name()),
         "self_id": self_id,
         "timestamp": timestamp,

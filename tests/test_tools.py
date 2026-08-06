@@ -184,7 +184,7 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
         "get_image_captions",
     ):
         tool = tool_set.get_tool(tool_name)
-        assert "msg=" in tool.parameters["properties"]["message_id"]["description"]
+        assert 'message_id="' in tool.parameters["properties"]["message_id"]["description"]
 
 
 @pytest.mark.parametrize(
@@ -1208,6 +1208,41 @@ async def test_history_tools_return_records_without_claiming_terminal_slot(tmp_p
     assert message["message_id"] == "m1"
     assert [item["message_id"] for item in search["messages"]] == ["m1"]
     assert event.get_extra("_group_agent_external_actions", []) == []
+
+
+@pytest.mark.asyncio
+async def test_history_tools_hide_internal_image_source_urls_from_model(tmp_path):
+    source_url = "https://signed.example.com/private.png?token=secret"
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "m1",
+            "sender_id": "alice",
+            "text": "image",
+            "components": [
+                {
+                    "type": "image",
+                    "url": "C:/AstrBot/temp/image.png",
+                    "source_url": source_url,
+                }
+            ],
+        },
+    )
+    tools = ToolRuntime(store, QQActionGateway()).build_tool_set()
+    event = FakeEvent()
+
+    message = await tools.get_tool("get_message").handler(event, message_id="m1")
+    search = await tools.get_tool("search_chat_history").handler(event, query="")
+
+    assert source_url not in message
+    assert source_url not in search
+    assert json.loads(message)["components"] == [
+        {"type": "image", "url": "C:/AstrBot/temp/image.png"}
+    ]
+    assert store.get_message("napcat:group:1", "m1")["components"][0][
+        "source_url"
+    ] == source_url
 
 
 @pytest.mark.asyncio

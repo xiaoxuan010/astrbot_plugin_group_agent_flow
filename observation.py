@@ -95,7 +95,10 @@ def _truncate_single_record(
         keep_chars = (low + high) // 2
         projected = deepcopy(record)
         tail = original_text[-keep_chars:] if keep_chars else ""
-        projected["text"] = f"{marker}{tail}"
+        truncated_text = f"{marker}{tail}"
+        projected["text"] = truncated_text
+        if isinstance(projected.get("components"), list) and projected["components"]:
+            projected["components"] = [{"type": "text", "text": truncated_text}]
         block = _render_block(renderer, [projected], counter)
         if block is not None and block.estimated_tokens <= token_budget:
             best = block

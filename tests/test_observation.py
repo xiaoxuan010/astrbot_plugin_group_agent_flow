@@ -2,7 +2,7 @@ import pytest
 from astrbot.core.agent.context.token_counter import EstimateTokenCounter
 from astrbot.core.agent.message import Message
 
-from observation import prepare_observation
+from observation import _truncate_single_record, prepare_observation
 from store import GroupFlowStore
 
 
@@ -123,6 +123,39 @@ def test_single_oversized_message_keeps_metadata_tail_and_lookup_marker(tmp_path
     assert "-TAIL</text>" in content
     assert "BEGIN-" not in content
     assert store.get_message(FLOW_ID, "oversized")["text"] == original
+
+
+def test_component_backed_truncation_replaces_model_visible_components():
+    class ComponentRenderer:
+        def render(self, events):
+            return [
+                {
+                    "role": "user",
+                    "content": events[0]["components"][0]["text"],
+                }
+            ]
+
+    class CharacterCounter:
+        def count_tokens(self, messages):
+            return sum(len(str(message.content)) for message in messages)
+
+    original = "BEGIN-" + ("x" * 500) + "-TAIL"
+    block = _truncate_single_record(
+        ComponentRenderer(),
+        {
+            "seq": 1,
+            "message_id": "oversized",
+            "text": original,
+            "components": [{"type": "text", "text": original}],
+        },
+        token_budget=100,
+        counter=CharacterCounter(),
+    )
+
+    assert block.estimated_tokens <= 100
+    assert "内容已截断" in block.contexts[0]["content"]
+    assert block.contexts[0]["content"].endswith("-TAIL")
+    assert "BEGIN-" not in block.contexts[0]["content"]
 
 
 def test_impossibly_small_token_budget_fails_instead_of_exceeding_limit(tmp_path):

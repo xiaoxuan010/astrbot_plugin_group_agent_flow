@@ -198,6 +198,29 @@ async def test_contentless_event_never_reaches_store(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plugin_command_is_not_recorded(monkeypatch):
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.config = {}
+    record_calls = []
+    llm_flags = []
+
+    monkeypatch.setattr(plugin, "_is_authorized", lambda _event: True)
+    monkeypatch.setattr(plugin, "_is_plugin_command", lambda _event: True)
+
+    async def unexpected_record(*_args, **_kwargs):
+        record_calls.append(True)
+        return None
+
+    monkeypatch.setattr(plugin, "_record", unexpected_record)
+    event = FakeEvent()
+    event.should_call_llm = lambda enabled: llm_flags.append(enabled)
+
+    assert [item async for item in plugin.observe_group_message(event)] == []
+    assert record_calls == []
+    assert llm_flags == [True]
+
+
+@pytest.mark.asyncio
 async def test_observation_run_does_not_ack_buffer_before_core_checkpoint(tmp_path):
     flow_id = "qq:group:1"
     store = GroupFlowStore(tmp_path)

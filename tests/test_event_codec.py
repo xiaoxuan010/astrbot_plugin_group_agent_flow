@@ -66,6 +66,19 @@ def test_extract_group_event_preserves_routing_and_reply_metadata():
     assert record["text"] == "[引用消息] [At:Bot] 正文 [图片]"
 
 
+def test_extract_group_event_hashes_fallback_message_id_without_chat_text():
+    event = FakeEvent()
+    event.message_obj.message_id = ""
+    event.get_message_outline = lambda: "私密聊天正文"
+
+    first = extract_group_event(event, max_text_chars=4000)
+    second = extract_group_event(event, max_text_chars=4000)
+
+    assert first["message_id"] == second["message_id"]
+    assert first["message_id"].startswith("synthetic:")
+    assert "私密聊天正文" not in first["message_id"]
+
+
 @pytest.mark.parametrize(
     ("reply_sender_id", "expected"),
     [("7", True), ("10002", False), (0, False)],

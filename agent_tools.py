@@ -28,6 +28,9 @@ SILENCE_SELECTED_EXTRA = "_group_agent_silence_selected"
 BATCH_ID_EXTRA = "_group_agent_batch_id"
 BATCH_RECORDS_EXTRA = "_group_agent_batch_records"
 CHECKPOINT_ID_EXTRA = "_group_agent_checkpoint_id"
+MESSAGE_ID_DESCRIPTION = (
+    'Exact message ID from the message_id="..." XML attribute in the observed context.'
+)
 
 
 def _json(payload: Any) -> str:
@@ -183,6 +186,24 @@ class ToolRuntime:
             if image_ref:
                 refs.append(image_ref)
         return refs
+
+    @staticmethod
+    def _model_visible_record(record: dict[str, Any]) -> dict[str, Any]:
+        """移除仅供插件内部下载图片使用的记录字段。"""
+        projected = dict(record)
+        components = record.get("components")
+        if isinstance(components, list):
+            projected["components"] = [
+                {
+                    key: value
+                    for key, value in component.items()
+                    if key != "source_url"
+                }
+                if isinstance(component, dict)
+                else component
+                for component in components
+            ]
+        return projected
 
     async def _external(
         self,
@@ -359,8 +380,9 @@ class ToolRuntime:
                 batch_id,
             )
             return _json(
-                record
-                or {
+                self._model_visible_record(record)
+                if record is not None
+                else {
                     "error": "message_not_found_in_snapshot",
                     "message_id": message_id,
                 }
@@ -546,7 +568,14 @@ class ToolRuntime:
                 limit=limit,
                 batch_id=batch_id or None,
             )
-            return _json({"messages": messages})
+            return _json(
+                {
+                    "messages": [
+                        self._model_visible_record(message)
+                        for message in messages
+                    ]
+                }
+            )
 
         string_array = {"type": "array", "items": {"type": "string"}}
         tools = [
@@ -571,7 +600,7 @@ class ToolRuntime:
                         "properties": {
                             "message_id": {
                                 "type": "string",
-                                "description": "Exact message ID shown as msg=... in the observed context.",
+                                "description": MESSAGE_ID_DESCRIPTION,
                             },
                             "content": {"type": "string", "maxLength": 500},
                             "mentions": string_array,
@@ -588,7 +617,7 @@ class ToolRuntime:
                         "properties": {
                             "message_id": {
                                 "type": "string",
-                                "description": "Exact message ID shown as msg=... in the observed context.",
+                                "description": MESSAGE_ID_DESCRIPTION,
                             },
                             "reaction": {
                                 "type": "string",
@@ -629,7 +658,7 @@ class ToolRuntime:
                         "properties": {
                             "message_id": {
                                 "type": "string",
-                                "description": "Exact message ID shown as msg=... in the observed context.",
+                                "description": MESSAGE_ID_DESCRIPTION,
                             }
                         },
                         "required": ["message_id"],
@@ -666,7 +695,7 @@ class ToolRuntime:
                         "properties": {
                             "message_id": {
                                 "type": "string",
-                                "description": "Exact message ID shown as msg=... in the observed context.",
+                                "description": MESSAGE_ID_DESCRIPTION,
                             }
                         },
                         "required": ["message_id"],
@@ -685,7 +714,7 @@ class ToolRuntime:
                         "properties": {
                             "message_id": {
                                 "type": "string",
-                                "description": "Exact message ID shown as msg=... in the observed context.",
+                                "description": MESSAGE_ID_DESCRIPTION,
                             }
                         },
                         "required": ["message_id"],

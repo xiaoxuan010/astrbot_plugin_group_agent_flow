@@ -354,9 +354,10 @@ class GroupAgentFlowPlugin(Star):
 
         # AstrBot 中该标志会阻止默认 LLM 链路，但不会阻止插件主动发起请求。
         event.should_call_llm(True)
-        plugin_command = self._is_plugin_command(event)
-        recorded = await self._record(event, schedule=not plugin_command)
-        if recorded is None or plugin_command:
+        if self._is_plugin_command(event):
+            return
+        recorded = await self._record(event, schedule=True)
+        if recorded is None:
             return
         suppress_builtin_active_reply(event)
         flow_id, _, _ = recorded

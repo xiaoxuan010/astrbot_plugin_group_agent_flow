@@ -28,7 +28,9 @@ Providers and gives every other Provider a text-caption path.
   `components[].source_url`; both tools prefer it over the legacy `components[].url` local
   reference.
 - `source_url` is only a tool-download reference. Context renderers use `components[].url`, so a
-  signed remote URL never enters the chat-model prompt.
+  signed remote URL never enters the chat-model prompt. `get_message` and
+  `search_chat_history` apply the same model-visible projection and omit `source_url` from their
+  JSON results.
 - `event_codec.py` keeps the optional raw OneBot `message_seq` on the message record. When Core
   cannot resolve an image reference, `get_message_images` asks `QQActionGateway` for fresh URLs:
   `get_msg(message_id)` first, then `get_group_msg_history(group_id, message_seq, count=20)` for
@@ -81,6 +83,8 @@ Providers and gives every other Provider a text-caption path.
   tests assert `source_url` takes precedence over an expired local path, ordered resolver calls
   with `strict=True`, NapCat refresh after expiry, metadata count, MIME types, `ImageContent`,
   future-message rejection, no-image rejection, and compact resolution errors.
+- History-tool tests assert that `source_url` remains available to image readers but never appears
+  in model-visible message or history-search results.
 - Gateway tests cover direct `get_msg` refresh and the `message_seq`-anchored group-history
   fallback.
 - Caption tests assert the dedicated Provider ID, prompt, ordered `image_urls`, merged caption,

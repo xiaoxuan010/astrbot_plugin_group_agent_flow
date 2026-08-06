@@ -18,25 +18,24 @@ context only and must not override the current SQLite lifecycle.
   ordinary `LLM_RESULT` content, reasoning, Provider errors, and internal tool status behind
   the send guard.
 - Keep renderer behavior deterministic. Every request uses the XML delta block renderer;
-  Core multi-role history remains in its original form while only the next JSONL suffix is
+  Core multi-role history remains in its original form while only the next SQLite Buffer suffix is
   projected into one XML `user` block.
 - Empty renderer input produces no user message. A stale or contentless snapshot stops in
   `OnLLMRequestEvent` before the Provider receives a request, and cursor updates remain
   monotonic across delayed runs.
 - On a missing history cursor, replace AstrBot conversation contexts with the plugin
-  token-bounded recent JSONL suffix selected from cursor `0` and reset conversation token
+  token-bounded recent SQLite Buffer suffix selected from cursor `0` and reset conversation token
   usage. On an existing history cursor, preserve Core contexts, render only the waterline
   delta, and add its estimate to the persisted token baseline before Provider preparation.
 - Preserve structured message metadata in storage even when a renderer projects it to text.
-- Persist each successful external action as a typed, non-targetable fact before the run's final
-  cursor commit. Extend an existing pending snapshot with the action seq without creating a
-  second scheduling path.
-- Build one observation suffix from JSONL in increasing sequence order. Use Core
+- Keep successful external actions in the current run event extras and Core conversation history;
+  never append them as SQLite Buffer facts.
+- Build one observation suffix from SQLite Buffer rows in increasing sequence order. Use Core
   `EstimateTokenCounter` and the configured hard token budget; trim oldest selected records
   when the suffix exceeds the budget. Keep earlier facts accessible through snapshot-bounded
   history tools.
-- Validate run generation under the per-flow lock before gateway admission, fact persistence,
-  and terminal state writes. Clear persistent and coordinator flow state in the same critical
+- Validate run generation under the per-flow lock before gateway admission and terminal state
+  writes. Clear persistent and coordinator flow state in the same critical
   section.
 - Keep `.astrbot-plugin/i18n/zh-CN.json` and `en-US.json` aligned with
   `_conf_schema.json`: every section and field has a localized `description`, schema
@@ -66,8 +65,6 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
 ## Review Checklist
 
 - Messages arriving during reasoning are reserved for the next snapshot.
-- A message reserved during reasoning followed by a later action record advances the existing
-  pending upper bound to the action seq; an action with no pending message remains unscheduled.
 - Inbound `append_record()` and coordinator `enqueue()` execute under one per-flow lock, so every
   action ordering is covered by the next valid pending snapshot.
 - A missing history cursor ignores stale ordinary cursors and legacy window data, then rebuilds
@@ -77,13 +74,11 @@ Also import `astrbot_plugin_group_agent_flow.main` with both the project parent 
   A single oversized record retains identity metadata and a visible recovery marker.
 - Multiple external actions from one Provider tool batch may execute in declared order, and an
   external action result may drive a later Provider call. The finalizer computes the run outcome
-  from the complete accumulated action list. No tool call ends as a persisted no-action outcome.
+  from the complete accumulated action list.
 - Unknown or future message IDs cannot be read or targeted.
-- Synthetic `agent-action:*` IDs remain readable through history tools and are rejected by
-  reply/react target validation.
 - Ordinary provider content, reasoning, Provider errors, and internal tool status cannot reach
   QQ; an explicit action tool reaches QQ exactly once.
-- External action handlers return compact structured results after fact persistence. Only
+- External action handlers return compact structured results. Only
   `stay_silent` returns AstrBot's `None` terminal signal and advances the cursor.
 - A delayed snapshot already covered by cursor records `empty_snapshot_skipped`, assigns no
   tools, and makes no Provider request.

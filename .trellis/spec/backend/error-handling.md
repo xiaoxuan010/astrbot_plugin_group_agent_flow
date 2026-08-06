@@ -25,7 +25,8 @@ tool that invokes the terminal callback and returns `None`.
 Use exceptions for invalid internal state and unsupported capabilities:
 
 - `GroupRunCoordinator.finish()` raises `KeyError` for an unknown run.
-- `build_renderer()` raises `ValueError` for an unknown renderer.
+- `build_renderer()` always returns the fixed XML delta renderer; renderer selection is not a
+  runtime configuration or error path.
 - `QQActionGateway` raises `ValueError` for missing owner configuration and `RuntimeError`
   when the current platform lacks a required QQ API.
 - Observation preparation raises `ValueError` when `max_context_tokens` cannot contain the
@@ -70,9 +71,9 @@ Different Providers use that field for role-play replies or control statements s
   the Core constants.
 - Explicit action tools call `tool_send()` through `QQActionGateway` and record the actual
   action name with `succeeded` or `failed` status.
-- A successful gateway result is encoded and persisted as `agent_action` before its structured
-  tool result. Encoding and write failures preserve the successful QQ result and attach only a
-  safe `fact_encode_failed:<type>` or `fact_persist_failed:<type>` diagnostic.
+- A successful gateway result is recorded in the current run event extras and retained by Core
+  conversation history before its structured tool result. The plugin does not append an
+  `agent_action` Buffer row.
 - Multiple actions in one Provider tool batch update the same run outcome from the complete
   accumulated action list; success plus failure becomes `action_partial`.
 - A response containing content `A` and `send_message("B")` sends only `B`.
@@ -86,8 +87,8 @@ Different Providers use that field for role-play replies or control statements s
   `shut_up_timestamp` produces
   `你已被禁言，无法发送消息；解禁时间：<ISO time>` using the same
   `Asia/Shanghai` ISO 8601 format as injected group-event timestamps and without the raw platform error;
-  query failure preserves the original platform diagnostic. A safe `fact_error` reports action-fact encoding or
-  persistence failure. It leaves cursor persistence to the unified response finalizer.
+  query failure preserves the original platform diagnostic. Cursor persistence remains owned by
+  the unified response finalizer.
 - `stay_silent` sets `_group_agent_silence_selected=True`, invokes the same terminal callback,
   records `silence_selected`, advances the pending cursor, and returns terminal `None` without
   sending to QQ or appending `_group_agent_external_actions`.
@@ -108,15 +109,11 @@ Different Providers use that field for role-play replies or control statements s
   timestamp -> failed action with the original platform error. Validate and format a future
   timestamp in one guarded block because the context renderer intentionally maps invalid event
   timestamps to the Unix epoch.
-- Action fact encoding failure after a successful send -> `action_succeeded` plus safe encoding
-  detail in a structured result.
-- Action fact write failure after a successful send -> `action_succeeded` plus safe persistence
-  detail in a structured result.
 - Invalid snapshot target before a gateway attempt -> structured JSON error; the model may
   choose a valid target in a later step.
 - Stale run before gateway admission -> failed action with `stale_run`; zero QQ calls.
-- Run cleared after gateway admission -> completed QQ side effect plus
-  `fact_persist_failed:RuntimeError`; stale terminal state writes are ignored.
+- Run cleared after gateway admission -> the QQ side effect may complete, while stale terminal
+  state writes are ignored.
 - `stay_silent` outside an autonomous run ->
   `RuntimeError("tool called outside an autonomous group run")`.
 - `stay_silent` after read-only tools -> terminal `silence_selected`; no QQ send.
@@ -149,10 +146,10 @@ Different Providers use that field for role-play replies or control statements s
   `no_cache=true`, a future `shut_up_timestamp` returns only the concise Chinese mute
   detail with the shared `Asia/Shanghai` ISO time format, and query failure or an out-of-range
   timestamp preserves the original `ActionFailed` diagnostic.
-- Runner integration asserts an action produces a QQ gateway call and `agent_action`, then a
-  follow-up Provider call can select `stay_silent`.
+- Runner integration asserts an action produces one QQ gateway call and Core retains its tool
+  history, then a follow-up Provider call can select `stay_silent`.
 - Batch tests assert later actions update the same run to the final succeeded/failed/partial
-  classification and keep safe fact diagnostics.
+  classification.
 - Silence-tool tests assert an empty object schema, marker-before-callback ordering, `[None]`,
   zero QQ effects, zero external action records, `silence_selected`, and cursor advancement.
 - Full suite asserts existing tool, snapshot, persistence, renderer, and i18n behavior.
@@ -206,7 +203,7 @@ event contains neither text nor components.
   calls `event.stop_event()`, and returns before assigning `req.func_tool`.
 - `set_cursor()` stores `max(current_cursor, requested_seq)` so a delayed run cannot regress
   state.
-- Records with empty `text` and empty `components` stay in JSONL for diagnostics and are
+- Records with empty `text` and empty `components` stay in the SQLite Buffer for diagnostics and are
   removed from the model projection.
 
 ### 4. Validation & Error Matrix
@@ -227,7 +224,7 @@ event contains neither text nor components.
 
 ### 6. Tests Required
 
-- Renderer test asserts all three renderers return `[]` for empty input.
+- Renderer test asserts the XML delta renderer returns `[]` for empty input.
 - Observation test asserts a contentless transport record produces no contexts while retaining
   `target_cursor`.
 - Hook test asserts the event is stopped, tools remain unassigned, and the skipped outcome is

@@ -10,8 +10,8 @@
   monotonic time and contains no I/O or AstrBot imports.
 - `observation.py` selects the cursor-to-snapshot range and delegates projection to
   `context_renderers.py`.
-- `context_renderers.py` contains interchangeable LLM context projections. A renderer
-  returns OpenAI-style message dictionaries and does not read storage or config.
+- `context_renderers.py` contains the fixed XML delta projection. The renderer returns
+  OpenAI-style message dictionaries and does not read storage or config.
 - `agent_tools.py` defines the model-visible tool schemas and explicit termination policy.
   `qq_gateway.py` contains QQ/AstrBot side effects.
 - `response_policy.py` owns the controlled platform boundary: it blocks ordinary model content,

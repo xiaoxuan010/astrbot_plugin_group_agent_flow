@@ -68,12 +68,15 @@ Wrong: advance a local history cursor and delete JSONL immediately after `on_llm
 Correct: hold bodies as `inflight` until Core raw history contains the newly appended checkpoint, then ack/delete.
 
 `main.py` still serializes flow mutations with a per-flow `asyncio.Lock`; SQLite transactions remain the
-final cross-thread boundary. Historical scenario text below describes older JSONL/cursor behavior and is
-retained only as migration context; new runtime code must follow the SQLite contract above.
+final cross-thread boundary.
 
-## Scenario: An external action enters the group fact stream
+## Historical architecture notes (archival; not implementation requirements)
 
-## Scenario: Core multi-role history is paired with JSONL deltas
+The following records preserve prior JSONL/cursor/action-fact design discussions. They may explain old
+commits, but new runtime code must follow the SQLite Buffer contract above and must not restore a renderer
+configuration, JSONL persistence, or local `agent_action` facts.
+
+### Core multi-role history paired with JSONL deltas
 
 ### 1. Scope / Trigger
 
@@ -130,7 +133,7 @@ Wrong: copy raw assistant/tool messages into JSONL and render every fact as `rol
 
 Correct: keep Core history as the raw multi-role source, keep JSONL as the ordered group-fact source, and join them only at the committed sequence waterline.
 
-## Scenario: Core persists a terminal tool chain without a final assistant response
+### Core persists a terminal tool chain without a final assistant response
 
 ### 1. Scope / Trigger
 
@@ -279,11 +282,12 @@ Correct: admit the current run under the flow lock, append a typed action fact t
 ordered JSONL source after the side effect, extend only an existing pending snapshot, then let
 the unified finalizer commit state for the same generation.
 
-## Scenario: Structured XML observation projection
+## Current XML observation projection
 
 ### 1. Scope / Trigger
 
-`context.renderer=xml_delta` projects one frozen observation into one XML `role=user` block. The projection consumes persisted JSONL `components`, so component fields are a storage-to-provider contract.
+The fixed XML delta renderer projects one frozen observation into one XML `role=user` block. The projection
+consumes persisted SQLite Buffer `components`, so component fields are a storage-to-provider contract.
 
 ### 2. Signatures
 
@@ -295,8 +299,8 @@ the unified finalizer commit state for the same generation.
 - The outer element is `<group_messages_delta group_id="…" group_name="…">`; `group_id` and `group_name` each use the first non-empty value in the batch.
 - Inbound `Reply` components persist `message_id`, `sender_id`, `sender_name`, `timestamp`, and `text`. The three latter fields are optional for old JSONL records.
 - `at` maps to `<mention>`; `user_id="all"` maps to `<mention all="true"/>`.
-- `text`, `reply`, `image`, `face`, `poke`, `voice`, `video`, and `file` retain their component boundary and JSONL order. Unknown types map to `<component type="…"/>`.
-- Every dynamic XML attribute and text node is escaped. Existing media URLs or local paths remain XML attributes; renderer projection does not attach binary media to the Provider request.
+- `text`, `reply`, `image`, `face`, `poke`, `voice`, `video`, and `file` retain their component boundary and Buffer order. Unknown types map to `<component type="…"/>`.
+- Every dynamic XML attribute and text node is escaped. Existing media URLs or local paths remain XML attributes; renderer projection does not attach binary media to the Provider request. Internal image `source_url` values are never rendered or returned by model-visible history tools.
 
 ### 4. Validation & Error Matrix
 
@@ -309,7 +313,7 @@ the unified finalizer commit state for the same generation.
 ### 5. Good/Base/Bad Cases
 
 - Good: a reply, mention, image, and text retain their order under one `<message>` element.
-- Base: a historic JSONL reply with only ID fields remains model-visible as a self-closing `<reply>` element.
+- Base: a historic reply with only ID fields remains model-visible as a self-closing `<reply>` element.
 - Bad: deriving group metadata only from the first record causes empty `group_name` when replayed actions precede the current message.
 
 ### 6. Tests Required
@@ -317,7 +321,6 @@ the unified finalizer commit state for the same generation.
 - Codec test asserts new Reply fields serialize from AstrBot's `Reply` component.
 - Renderer test asserts outer metadata, XML escaping, component ordering, all supported media types, all-mention, unknown fallback, and action metadata.
 - Renderer regression test puts an empty-name action before a named group message and asserts the outer group name comes from the latter.
-- i18n test asserts `xml_delta` and both localized labels/hints stay aligned with schema options.
 
 ### 7. Wrong vs Correct
 
@@ -330,7 +333,7 @@ Correct: persist the structured component fields at ingestion, then render them 
 ### 1. Scope / Trigger
 
 A frozen snapshot contains at least one model-visible record. The Provider receives one
-token-bounded JSONL suffix selected from the committed Core-history waterline.
+token-bounded SQLite Buffer suffix selected from the committed Core-history waterline.
 
 ### 2. Signatures
 
@@ -354,7 +357,7 @@ token-bounded JSONL suffix selected from the committed Core-history waterline.
   retains identity metadata, a text tail, and a visible `get_message` recovery marker.
 - A successful run commits the ordinary cursor and `history_cursor=snapshot_seq` together.
   The state schema contains no `observation_windows` or renderer-specific block boundaries.
-- `/gaf_clear` removes logs, cursors, renderer assignments, history cursors, run outcomes, and the
+- `/gaf_clear` removes Buffer rows and flow metadata, clears the Core conversation, and resets the
   coordinator flow state inside one per-flow critical section.
 
 ### 4. Validation & Error Matrix
@@ -392,5 +395,5 @@ Wrong: restore persisted block windows, apply a second retention ratio, replay i
 actions separately, or clear a trusted Core token baseline while retaining its contexts.
 
 Correct: bootstrap a token-bounded recent suffix from cursor `0`, continue from the committed
-history cursor with one JSONL delta and an adjusted Core token baseline, commit both cursors in
-one state-file replacement, and query older facts through snapshot-bounded tools.
+history cursor with one SQLite Buffer delta and an adjusted Core token baseline, commit both
+cursors through the store, and query older facts through snapshot-bounded tools.

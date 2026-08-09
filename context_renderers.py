@@ -31,11 +31,6 @@ def format_group_timestamp(timestamp: Any, *, strict: bool = False) -> str:
     return _datetime(timestamp).isoformat()
 
 
-def _is_agent_action(event: dict[str, Any]) -> bool:
-    """识别插件生成的机器人动作事实。"""
-    return _one_line(event.get("record_kind")) == "agent_action"
-
-
 def _xml_attrs(**values: Any) -> str:
     """构造省略空值且经过 XML 转义的属性串。"""
     return "".join(
@@ -89,26 +84,14 @@ def _xml_component(component: dict[str, Any]) -> str:
 
 
 def _xml_record(event: dict[str, Any]) -> str:
-    """将一条群事件或机器人动作投影为 XML 记录。"""
+    """将一条群消息投影为 XML 记录。"""
     timestamp = _xml_timestamp(event.get("timestamp"))
-    if _is_agent_action(event):
-        attrs = _xml_attrs(
-            action_name=event.get("action_name"),
-            action_status=event.get("action_status"),
-            action_id=event.get("message_id"),
-            timestamp=timestamp,
-            target_message_id=event.get("target_message_id") or event.get("reply_to"),
-            target_user_id=event.get("target_user_id"),
-        )
-        tag = "action"
-    else:
-        attrs = _xml_attrs(
-            message_id=event.get("message_id"),
-            sender_id=event.get("sender_id"),
-            sender_name=event.get("sender_name"),
-            timestamp=timestamp,
-        )
-        tag = "message"
+    attrs = _xml_attrs(
+        message_id=event.get("message_id"),
+        sender_id=event.get("sender_id"),
+        sender_name=event.get("sender_name"),
+        timestamp=timestamp,
+    )
     components = event.get("components")
     if isinstance(components, list) and components:
         body = "".join(
@@ -119,7 +102,7 @@ def _xml_record(event: dict[str, Any]) -> str:
         )
     else:
         body = f"<text>{_xml_text(event.get('text'))}</text>"
-    return f"<{tag}{attrs}>{body}</{tag}>"
+    return f"<message{attrs}>{body}</message>"
 
 
 def _first_nonempty(events: list[dict[str, Any]], field: str) -> Any:

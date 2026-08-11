@@ -84,11 +84,14 @@ Different Providers use that field for role-play replies or control statements s
   and is recorded on the failed action; an empty diagnostic omits the optional field. For
   `send_message` and `reply_message`, a QQNT `sendMsg` failure queries the
   current bot through `get_group_member_info(no_cache=true)`. A future
-  `shut_up_timestamp` produces
+  `shut_up_timestamp` takes precedence and produces
   `你已被禁言，无法发送消息；解禁时间：<ISO time>` using the same
-  `Asia/Shanghai` ISO 8601 format as injected group-event timestamps and without the raw platform error;
-  query failure preserves the original platform diagnostic. Cursor persistence remains owned by
-  the unified response finalizer.
+  `Asia/Shanghai` ISO 8601 format as injected group-event timestamps and without the raw platform error.
+  If personal mute is not confirmed, query `get_group_info(group_id, self_id)`; a documented
+  `group_all_shut` value of `true`, `1`, or `"1"` returns exactly
+  `群已开启全员禁言，无法发送消息`, again without the raw platform error. Any status-query
+  failure, non-mapping response, unknown flag, or disabled flag preserves the original platform
+  diagnostic. Cursor persistence remains owned by the unified response finalizer.
 - `stay_silent` sets `_group_agent_silence_selected=True`, invokes the same terminal callback,
   records `silence_selected`, advances the pending cursor, and returns terminal `None` without
   sending to QQ or appending `_group_agent_external_actions`.
@@ -105,10 +108,13 @@ Different Providers use that field for role-play replies or control statements s
   platform diagnostic is returned to the model as `detail`.
 - QQNT `sendMsg` failure plus current bot `shut_up_timestamp > now` -> failed action with
   a concise Chinese mute detail and no raw platform error.
-- Mute-status query failure, missing/non-numeric/out-of-range `shut_up_timestamp`, or expired
-  timestamp -> failed action with the original platform error. Validate and format a future
-  timestamp in one guarded block because the context renderer intentionally maps invalid event
-  timestamps to the Unix epoch.
+- QQNT `sendMsg` failure plus no future personal mute and `get_group_info(...).group_all_shut`
+  equal to `true`, `1`, or `"1"` -> failed action with exactly
+  `群已开启全员禁言，无法发送消息` and no raw platform error.
+- Mute-status query failure, missing/non-numeric/out-of-range `shut_up_timestamp`, an invalid
+  group response, or disabled/unknown `group_all_shut` -> failed action with the original platform
+  error. Validate and format a future timestamp in one guarded block because the context renderer
+  intentionally maps invalid event timestamps to the Unix epoch.
 - Invalid snapshot target before a gateway attempt -> structured JSON error; the model may
   choose a valid target in a later step.
 - Stale run before gateway admission -> failed action with `stale_run`; zero QQ calls.
@@ -123,6 +129,9 @@ Different Providers use that field for role-play replies or control statements s
 - Good: `content="A"` plus `send_message("B")` sends only `B` and terminates the loop.
 - Good: a QQNT `sendMsg` failure while the current bot has a future
   `shut_up_timestamp` returns an explicit Chinese mute detail and `+08:00` ISO release time.
+- Good: a QQNT `sendMsg` failure with `shut_up_timestamp=0` and
+  `group_all_shut=1` returns the exact group-wide mute detail, so a later Provider call can select
+  `stay_silent` instead of receiving an opaque `ActionFailed` payload.
 - Good: a read-only lookup followed by `stay_silent()` sends nothing, records
   `silence_selected`, and advances the cursor.
 - Base: `No Action Needed` with no tool sends nothing and records `direct_output_suppressed`.
@@ -144,8 +153,11 @@ Different Providers use that field for role-play replies or control statements s
   diagnostics reach the model as `detail`, while an empty diagnostic omits the field.
 - Mute-diagnostic tests assert `get_group_member_info` uses the current group and bot with
   `no_cache=true`, a future `shut_up_timestamp` returns only the concise Chinese mute
-  detail with the shared `Asia/Shanghai` ISO time format, and query failure or an out-of-range
-  timestamp preserves the original `ActionFailed` diagnostic.
+  detail with the shared `Asia/Shanghai` ISO time format, and `get_group_info` receives the same
+  group and bot routing values after personal mute is not confirmed. Cover both `send_message` and
+  snapshot-authorized `reply_message`: `group_all_shut=1` must return only the exact group-wide
+  detail in both the model tool result and external-action record. Query failure, invalid/disabled
+  group flags, and an out-of-range timestamp preserve the original `ActionFailed` diagnostic.
 - Runner integration asserts an action produces one QQ gateway call and Core retains its tool
   history, then a follow-up Provider call can select `stay_silent`.
 - Batch tests assert later actions update the same run to the final succeeded/failed/partial
@@ -173,10 +185,12 @@ emit text.
 Correct: require `stay_silent()` as the explicit zero-side-effect terminal choice and keep
 ordinary text classified as `direct_output_suppressed`.
 
-Wrong: translate QQNT `sendMsg result=120` directly to `bot_muted`.
+Wrong: translate QQNT `sendMsg result=120` directly to `bot_muted`, or check only a member
+`shut_up_timestamp` when the group can be under all-member mute.
 
-Correct: verify the current bot's live `shut_up_timestamp`, then replace the model-visible
-platform error with the concise mute reason while that timestamp is in the future.
+Correct: verify the current bot's live `shut_up_timestamp` first, then verify the documented
+group `group_all_shut` flag. Replace the model-visible platform error only after either live state
+is confirmed; otherwise retain the original diagnostic.
 
 Avoid broad exception handling around pure logic. At external QQ boundaries, record enough
 detail for diagnostics while keeping credentials and full message content out of logs.

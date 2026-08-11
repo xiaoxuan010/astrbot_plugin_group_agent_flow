@@ -31,6 +31,7 @@ QQ_REACTION_IDS = {
 }
 SUPPORTED_REACTIONS = tuple(QQ_REACTION_IDS)
 MESSAGE_SEND_ACTIONS = frozenset({"send_message", "reply_message"})
+GROUP_WIDE_MUTE_DETAIL = "群已开启全员禁言，无法发送消息"
 
 
 class QQActionGateway:
@@ -158,13 +159,20 @@ class QQActionGateway:
                 self_id=int(self_id) if self_id.isdigit() else self_id,
             )
             mute_until = int(member.get("shut_up_timestamp") or 0)
-            if mute_until <= int(time.time()):
-                return platform_error
-            release_time = format_group_timestamp(mute_until, strict=True)
+            if mute_until > int(time.time()):
+                release_time = format_group_timestamp(mute_until, strict=True)
+                return f"你已被禁言，无法发送消息；解禁时间：{release_time}"
+
+            group = await bot.call_action(
+                "get_group_info",
+                group_id=int(group_id) if group_id.isdigit() else group_id,
+                self_id=int(self_id) if self_id.isdigit() else self_id,
+            )
+            if group.get("group_all_shut") in (True, 1, "1"):
+                return GROUP_WIDE_MUTE_DETAIL
         except Exception:
             return platform_error
-        else:
-            return f"你已被禁言，无法发送消息；解禁时间：{release_time}"
+        return platform_error
 
     async def send_message(
         self,

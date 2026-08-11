@@ -312,7 +312,7 @@ async def test_get_message_images_returns_core_multimodal_content(
 
 
 @pytest.mark.asyncio
-async def test_get_message_images_keeps_caption_for_history_compaction(
+async def test_get_message_images_defers_one_caption_until_loop_completion(
     tmp_path, monkeypatch
 ):
     store = GroupFlowStore(tmp_path)
@@ -331,11 +331,11 @@ async def test_get_message_images_keeps_caption_for_history_compaction(
         return SimpleNamespace(base64_data="base64-png", mime_type="image/png")
 
     class CaptionProvider:
+        def __init__(self):
+            self.calls = []
+
         async def text_chat(self, **kwargs):
-            assert kwargs == {
-                "prompt": "请用一句中文描述图片。",
-                "image_urls": ["https://example.com/a.png"],
-            }
+            self.calls.append(kwargs)
             return SimpleNamespace(completion_text="部署结果截图，显示成功。")
 
     monkeypatch.setattr(
@@ -363,15 +363,27 @@ async def test_get_message_images_keeps_caption_for_history_compaction(
     ).build_tool_set(event).get_tool("get_message_images")
 
     result = await tool.handler(event, message_id="m1")
+    repeated_result = await tool.handler(event, message_id="m1")
 
     assert isinstance(result, CallToolResult)
+    assert isinstance(repeated_result, CallToolResult)
     assert result.content[0] == TextContent(
         type="text",
-        text=(
-            '{"message_id":"m1","image_count":1,'
-            '"caption":"部署结果截图，显示成功。"}'
-        ),
+        text='{"message_id":"m1","image_count":1}',
     )
+    assert context.providers["caption-provider"].calls == []
+
+    assert await ToolRuntime(
+        store,
+        QQActionGateway(),
+        context=context,
+    ).get_loop_image_caption(event) == "部署结果截图，显示成功。"
+    assert context.providers["caption-provider"].calls == [
+        {
+            "prompt": "请用一句中文描述图片。",
+            "image_urls": ["https://example.com/a.png"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -990,6 +1002,82 @@ async def test_action_failed_result_returns_verified_bot_mute_to_model(tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("send_message", {"content": "A"}),
+        ("reply_message", {"message_id": "42", "content": "A"}),
+    ],
+)
+async def test_action_failed_result_returns_verified_group_wide_mute_to_model(
+    tmp_path,
+    tool_name,
+    arguments,
+):
+    store = GroupFlowStore(tmp_path)
+    if tool_name == "reply_message":
+        store.append_record(
+            "napcat:group:1",
+            {"message_id": "42", "sender_id": "alice", "text": "A"},
+        )
+    runtime = ToolRuntime(store, QQActionGateway())
+    event = FakeEvent()
+    failure = ActionFailed(
+        {
+            "status": "failed",
+            "retcode": 1200,
+            "data": None,
+            "message": "NodeIKernelMsgService/sendMsg result=120",
+            "wording": "NodeIKernelMsgService/sendMsg result=120",
+        }
+    )
+
+    async def fail_send(_chain):
+        raise failure
+
+    async def get_mute_state(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        if action == "get_group_member_info":
+            return {"shut_up_timestamp": 0}
+        if action == "get_group_info":
+            return {"group_all_shut": 1}
+        raise AssertionError(f"unexpected action: {action}")
+
+    event.send = fail_send
+    event.bot.call_action = get_mute_state
+
+    result = json.loads(
+        await runtime.build_tool_set().get_tool(tool_name).handler(event, **arguments)
+    )
+
+    assert result == {
+        "success": False,
+        "action": tool_name,
+        "error": "ActionFailed",
+        "detail": "群已开启全员禁言，无法发送消息",
+    }
+    assert event.bot.actions == [
+        (
+            "get_group_member_info",
+            {
+                "group_id": 1,
+                "user_id": 7,
+                "no_cache": True,
+                "self_id": 7,
+            },
+        ),
+        ("get_group_info", {"group_id": 1, "self_id": 7}),
+    ]
+    assert event.get_extra("_group_agent_external_actions") == [
+        {
+            "action_name": tool_name,
+            "status": "failed",
+            "detail": "群已开启全员禁言，无法发送消息",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_mute_status_query_failure_preserves_platform_diagnostic(tmp_path):
     runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
     event = FakeEvent()
@@ -1024,6 +1112,88 @@ async def test_mute_status_query_failure_preserves_platform_diagnostic(tmp_path)
     assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(
         failure
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_state", [{}, {"group_all_shut": 0}, {"group_all_shut": "yes"}])
+async def test_unconfirmed_group_wide_mute_preserves_platform_diagnostic(
+    tmp_path,
+    group_state,
+):
+    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    event = FakeEvent()
+    failure = ActionFailed(
+        {
+            "status": "failed",
+            "retcode": 1200,
+            "data": None,
+            "message": "NodeIKernelMsgService/sendMsg result=120",
+            "wording": "NodeIKernelMsgService/sendMsg result=120",
+        }
+    )
+
+    async def fail_send(_chain):
+        raise failure
+
+    async def get_mute_state(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        if action == "get_group_member_info":
+            return {"shut_up_timestamp": 0}
+        if action == "get_group_info":
+            return group_state
+        raise AssertionError(f"unexpected action: {action}")
+
+    event.send = fail_send
+    event.bot.call_action = get_mute_state
+
+    result = json.loads(
+        await runtime.build_tool_set().get_tool("send_message").handler(event, content="A")
+    )
+
+    assert result["detail"] == str(failure)
+    assert [action for action, _kwargs in event.bot.actions] == [
+        "get_group_member_info",
+        "get_group_info",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_mute_status_query_failure_preserves_platform_diagnostic(tmp_path):
+    runtime = ToolRuntime(GroupFlowStore(tmp_path), QQActionGateway())
+    event = FakeEvent()
+    failure = ActionFailed(
+        {
+            "status": "failed",
+            "retcode": 1200,
+            "data": None,
+            "message": "NodeIKernelMsgService/sendMsg result=120",
+            "wording": "NodeIKernelMsgService/sendMsg result=120",
+        }
+    )
+
+    async def fail_send(_chain):
+        raise failure
+
+    async def get_mute_state(action, **kwargs):
+        event.bot.actions.append((action, kwargs))
+        if action == "get_group_member_info":
+            return {"shut_up_timestamp": 0}
+        if action == "get_group_info":
+            raise RuntimeError("group status unavailable")
+        raise AssertionError(f"unexpected action: {action}")
+
+    event.send = fail_send
+    event.bot.call_action = get_mute_state
+
+    result = json.loads(
+        await runtime.build_tool_set().get_tool("send_message").handler(event, content="A")
+    )
+
+    assert result["detail"] == str(failure)
+    assert [action for action, _kwargs in event.bot.actions] == [
+        "get_group_member_info",
+        "get_group_info",
+    ]
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import ImageURLPart, TextPart
 from astrbot.core.astr_main_agent_resources import (
     TOOL_CALL_PROMPT,
     TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
@@ -53,6 +54,27 @@ from .store import (
 
 
 AUTONOMOUS_EXTRA = "_group_agent_autonomous"
+RUN_CONTEXT_EXTRA = "_group_agent_run_context"
+
+
+def _compact_tool_images(run_context: Any) -> None:
+    """Replace loop-only tool images before the context becomes history."""
+    for message in getattr(run_context, "messages", []):
+        content = getattr(message, "content", None)
+        if not isinstance(content, list) or not any(
+            isinstance(part, ImageURLPart) for part in content
+        ):
+            continue
+        # Tool images are needed by later steps in this agent loop, but the
+        # final run context is persisted as conversation history.
+        message.content = [
+            TextPart(
+                text=(
+                    "Image has been compacted. Its description is retained "
+                    "in the preceding tool result."
+                )
+            )
+        ]
 
 AGENT_PROTOCOL_PROMPT = """
 You are an autonomous participant in a QQ group chat.
@@ -513,6 +535,7 @@ class GroupAgentFlowPlugin(Star):
 
     async def _finalize_terminal_observation(self, event: AstrMessageEvent) -> None:
         """在外部动作返回终止信号前提交本轮状态。"""
+        _compact_tool_images(event.get_extra(RUN_CONTEXT_EXTRA))
         await self._persist_observation_state(event, had_direct_output=False)
 
     async def _persist_observation_state(
@@ -557,6 +580,7 @@ class GroupAgentFlowPlugin(Star):
         """移除请求钩子之后由 AstrBot 全局追加的工具。"""
         if not event.get_extra(AUTONOMOUS_EXTRA, False):
             return
+        event.set_extra(RUN_CONTEXT_EXTRA, run_context)
         request = event.get_extra("provider_request")
         if isinstance(request, ProviderRequest):
             enforce_tool_set(request, self.tool_runtime.build_tool_set(event))
@@ -571,6 +595,7 @@ class GroupAgentFlowPlugin(Star):
         """将最终的直接 assistant 消息标记为仅供内部使用。"""
         if event.get_extra(AUTONOMOUS_EXTRA, False):
             suppress_direct_output(resp, run_context=run_context)
+            _compact_tool_images(run_context)
 
     @filter.on_decorating_result(priority=-maxsize + 20)
     async def suppress_pipeline_result(self, event: AstrMessageEvent):

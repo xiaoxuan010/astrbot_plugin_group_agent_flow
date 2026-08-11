@@ -110,3 +110,85 @@ tool_set = runtime.build_tool_set(event)
 
 Build each request's tool set from the current event: an explicit `"image"` modality adds
 `get_message_images`; every other capability state adds `get_image_captions`.
+
+## Scenario: Compact tool images when an autonomous observation loop ends
+
+### 1. Scope / Trigger
+
+Apply this contract to a group-agent `get_message_images` result. The Core runner must keep
+the image in the current Agent loop so follow-up tool reasoning can inspect it, but the final
+`run_context.messages` becomes ordinary conversation history and must not retain the original
+image data.
+
+### 2. Signatures
+
+- `get_message_images(message_id: str) -> CallToolResult | str`
+- `_compact_tool_images(run_context: Any) -> None`
+- `GroupAgentFlowPlugin.enforce_autonomous_tools(event, run_context) -> None`
+- `GroupAgentFlowPlugin._finalize_terminal_observation(event) -> None`
+- Event-only transient key: `RUN_CONTEXT_EXTRA = "_group_agent_run_context"`
+
+### 3. Contracts
+
+- `get_message_images` continues to return `ImageContent` for the current loop. When the
+  configured caption provider produces a non-empty caption, its leading text metadata is
+  `{"message_id":"...","image_count":N,"caption":"..."}`. If captioning is unavailable
+  or fails, image delivery remains available and the metadata simply omits `caption`.
+- `enforce_autonomous_tools` saves the current `run_context` only in the event extra for the
+  active loop. It is not persisted or exposed to the model as data.
+- `_compact_tool_images` replaces every `user` content block that contains an `ImageURLPart`
+  with one `TextPart`: `Image has been compacted. Its description is retained in the preceding
+  tool result.` It must remove the image data and cache-path prompt, while the preceding tool
+  result retains the caption when available.
+- Call the compactor both from `on_agent_done` and from `_finalize_terminal_observation` before
+  state finalization. `stay_silent` returns `None` to Core and therefore can bypass
+  `on_agent_done`; its terminal callback is mandatory for this contract.
+- This applies only when `AUTONOMOUS_EXTRA` is set. Normal Core Agent image history is unchanged.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| Caption Provider unavailable, fails, or returns empty text | Keep the current-loop image; omit `caption`; do not fail the image tool. |
+| Normal assistant completion | Compact before Core `_save_to_history()` receives `run_context.messages`. |
+| `stay_silent()` | Terminal callback compacts before state persistence and Core history save. |
+| A non-autonomous request | Do not attach the transient run context or compact its images. |
+| Context contains no `ImageURLPart` | Leave it unchanged. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the image tool returns a caption plus `ImageContent`; later calls in the same loop see
+  the original image; after `stay_silent`, history holds caption metadata and compacted text only.
+- Base: no caption Provider is configured; the current loop can still inspect the image, then
+  history keeps only the compacted text notice.
+- Bad: compacting in `on_agent_done` only; `stay_silent` reaches Core history with raw image data.
+
+### 6. Tests Required
+
+- `tests/test_tools.py` asserts image metadata contains the configured Provider caption while
+  preserving Core-compatible `ImageContent`.
+- `tests/test_main_observation.py` asserts ordinary Agent completion removes `ImageURLPart` and
+  keeps the preceding caption tool result.
+- `tests/test_main_observation.py` asserts `_finalize_terminal_observation` performs the same
+  removal before the `stay_silent` state callback completes.
+
+### 7. Wrong vs Correct
+
+Wrong:
+
+```python
+@filter.on_agent_done()
+async def compact(event, run_context, response):
+    _compact_tool_images(run_context)
+```
+
+Correct:
+
+```python
+async def _finalize_terminal_observation(self, event):
+    _compact_tool_images(event.get_extra(RUN_CONTEXT_EXTRA))
+    await self._persist_observation_state(event, had_direct_output=False)
+```
+
+Keep the `on_agent_done` call as well: it covers normal final responses, while the terminal
+callback covers the `None` result used by `stay_silent`.

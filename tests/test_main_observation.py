@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import ImageURLPart, Message, TextPart
 from astrbot.core.astr_main_agent_resources import (
     TOOL_CALL_PROMPT,
     TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
@@ -29,6 +30,7 @@ import astrbot_plugin_group_agent_flow.main as main_module  # noqa: E402
 from astrbot_plugin_group_agent_flow.main import (  # noqa: E402
     AUTONOMOUS_EXTRA,
     GroupAgentFlowPlugin,
+    RUN_CONTEXT_EXTRA,
 )
 from astrbot_plugin_group_agent_flow.store import (  # noqa: E402
     AppendResult,
@@ -80,6 +82,87 @@ def _activate_run(plugin, flow_id: str, snapshot_seq: int):
     snapshot = coordinator.begin_if_due(flow_id, now=0)
     plugin.coordinator = coordinator
     return snapshot
+
+
+@pytest.mark.asyncio
+async def test_agent_done_compacts_tool_images_before_history_save():
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    event = FakeEvent({AUTONOMOUS_EXTRA: True})
+    run_context = SimpleNamespace(
+        messages=[
+            Message(
+                role="tool",
+                tool_call_id="call-image",
+                content='{"message_id":"m1","caption":"一张部署截图"}',
+            ),
+            Message(
+                role="user",
+                content=[
+                    TextPart(text="[Image from tool 'get_message_images']"),
+                    ImageURLPart(
+                        image_url=ImageURLPart.ImageURL(
+                            url="data:image/png;base64,dGVzdA=="
+                        )
+                    ),
+                ],
+            ),
+        ]
+    )
+
+    await plugin.remove_direct_output_from_history(
+        event,
+        run_context,
+        SimpleNamespace(completion_text="", result_chain=None),
+    )
+
+    assert run_context.messages[0].content == '{"message_id":"m1","caption":"一张部署截图"}'
+    assert run_context.messages[1].content == [
+        TextPart(
+            text=(
+                "Image has been compacted. Its description is retained "
+                "in the preceding tool result."
+            )
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_observation_compacts_tool_images_before_stay_silent():
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    event = FakeEvent({AUTONOMOUS_EXTRA: True})
+    run_context = SimpleNamespace(
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    ImageURLPart(
+                        image_url=ImageURLPart.ImageURL(
+                            url="data:image/png;base64,dGVzdA=="
+                        )
+                    )
+                ],
+            )
+        ]
+    )
+    event.set_extra(RUN_CONTEXT_EXTRA, run_context)
+    persisted = []
+
+    async def persist(_event, *, had_direct_output):
+        persisted.append(had_direct_output)
+
+    plugin._persist_observation_state = persist
+
+    await plugin._finalize_terminal_observation(event)
+
+    assert persisted == [False]
+    assert run_context.messages[0].content == [
+        TextPart(
+            text=(
+                "Image has been compacted. Its description is retained "
+                "in the preceding tool result."
+            )
+        )
+    ]
 
 
 def test_system_prompt_requires_tools_without_duplicating_tool_names():

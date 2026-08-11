@@ -416,16 +416,30 @@ class ToolRuntime:
                     }
                 )
 
+            caption = ""
+            try:
+                caption_payload = json.loads(
+                    await get_image_captions(event, message_id)
+                )
+                if isinstance(caption_payload, dict):
+                    caption = str(caption_payload.get("caption") or "").strip()
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] failed to retain image caption "
+                    f"message_id={message_id} error={type(exc).__name__}"
+                )
+
             async def build_image_result(image_refs: list[str]) -> CallToolResult:
+                metadata: dict[str, Any] = {
+                    "message_id": message_id,
+                    "image_count": len(image_refs),
+                }
+                if caption:
+                    metadata["caption"] = caption
                 content: list[TextContent | ImageContent] = [
                     TextContent(
                         type="text",
-                        text=_json(
-                            {
-                                "message_id": message_id,
-                                "image_count": len(image_refs),
-                            }
-                        ),
+                        text=_json(metadata),
                     )
                 ]
                 for image_ref in image_refs:

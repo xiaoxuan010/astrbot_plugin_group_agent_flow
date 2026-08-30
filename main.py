@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from math import ceil
 from pathlib import Path
 from sys import maxsize
 from typing import Any
@@ -20,6 +21,7 @@ from astrbot.core.astr_main_agent_resources import (
 )
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from astrbot.core.utils.media_utils import MediaResolver, get_media_duration
 
 from .agent_tools import (
     BATCH_ID_EXTRA,
@@ -35,7 +37,7 @@ from .agent_tools import (
 )
 from .coordinator import GroupRunCoordinator
 from .event_codec import extract_group_event
-from .observation import prepare_observation_records
+from .observation import AudioAttachment, prepare_observation_records
 from .qq_gateway import QQActionGateway
 from .response_policy import (
     EXTERNAL_ACTIONS_EXTRA,
@@ -58,15 +60,14 @@ RUN_CONTEXT_EXTRA = "_group_agent_run_context"
 
 
 def _compact_tool_images(run_context: Any) -> None:
-    """Replace loop-only tool images before the context becomes history."""
+    """在上下文成为历史前，压缩仅用于工具循环的图片。"""
     for message in getattr(run_context, "messages", []):
         content = getattr(message, "content", None)
         if not isinstance(content, list) or not any(
             isinstance(part, ImageURLPart) for part in content
         ):
             continue
-        # Tool images are needed by later steps in this agent loop, but the
-        # final run context is persisted as conversation history.
+        # 工具图片供本轮 agent 循环后续步骤使用，但最终运行上下文会被持久化为对话历史。
         message.content = [
             TextPart(
                 text=(
@@ -75,6 +76,7 @@ def _compact_tool_images(run_context: Any) -> None:
                 )
             )
         ]
+
 
 AGENT_PROTOCOL_PROMPT = """
 You are an autonomous participant in a QQ group chat.
@@ -216,6 +218,62 @@ class GroupAgentFlowPlugin(Star):
         """返回群级锁，串行化同一群流水的文件修改。"""
         return self._locks.setdefault(flow_id, asyncio.Lock())
 
+    def _current_provider_supports_audio(self, event: AstrMessageEvent) -> bool:
+        """仅当所选 Provider 显式声明音频能力时才附带语音。"""
+        context = getattr(self, "context", None)
+        if context is None or event is None:
+            return False
+        try:
+            provider = context.get_using_provider(event.unified_msg_origin)
+            config = getattr(provider, "provider_config", None)
+            modalities = config.get("modalities") if isinstance(config, dict) else None
+            return isinstance(modalities, list) and "audio" in modalities
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] failed to inspect audio capability "
+                f"error={type(exc).__name__}"
+            )
+            return False
+
+    @staticmethod
+    def _voice_refs(record: dict[str, Any]) -> list[str]:
+        """委托给 ToolRuntime 提取内部语音引用 URL。"""
+        return ToolRuntime._message_voice_refs(record)
+
+    async def _resolve_voice_attachments(
+        self, records: list[dict[str, Any]]
+    ) -> tuple[AudioAttachment, ...]:
+        """探测内部语音引用并获取时长，但不暴露原始 URL 给文字上下文。"""
+        attachments = []
+        for record in records:
+            try:
+                seq = int(record.get("seq") or 0)
+            except (TypeError, ValueError):
+                continue
+            if seq <= 0:
+                continue
+            for voice_ref in self._voice_refs(record):
+                try:
+                    async with MediaResolver(
+                        voice_ref, media_type="audio"
+                    ).as_path() as media:
+                        duration_ms = await get_media_duration(str(media.path))
+                    if not isinstance(duration_ms, int) or duration_ms <= 0:
+                        raise ValueError("invalid voice duration")
+                    attachments.append(
+                        AudioAttachment(
+                            seq=seq,
+                            url=voice_ref,
+                            token_cost=ceil(duration_ms / 1000 * 6.25),
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] skipped voice attachment "
+                        f"seq={seq} error={type(exc).__name__}"
+                    )
+        return tuple(attachments)
+
     async def _admit_external_action(
         self,
         flow_id: str,
@@ -333,7 +391,10 @@ class GroupAgentFlowPlugin(Star):
             if str(item.get("role") or "") != "_checkpoint":
                 continue
             content = item.get("content")
-            if isinstance(content, dict) and str(content.get("id") or "") == checkpoint_id:
+            if (
+                isinstance(content, dict)
+                and str(content.get("id") or "") == checkpoint_id
+            ):
                 count += 1
         return count
 
@@ -478,10 +539,14 @@ class GroupAgentFlowPlugin(Star):
             ):
                 event.stop_event()
                 return
+            audio_attachments = ()
+            if self._current_provider_supports_audio(event):
+                audio_attachments = await self._resolve_voice_attachments(records)
             prepared = prepare_observation_records(
                 records,
                 snapshot_seq=snapshot_seq,
                 max_context_tokens=int(self._cfg("max_context_tokens", 8192) or 0),
+                audio_attachments=audio_attachments,
             )
             req.conversation.token_usage = (
                 req.conversation.token_usage or 0
@@ -499,6 +564,7 @@ class GroupAgentFlowPlugin(Star):
             event.stop_event()
             return
         req.contexts = [*req.contexts, *prepared.contexts]
+        req.audio_urls = list(prepared.audio_urls)
         req.func_tool = self.tool_runtime.build_tool_set(event)
         if bool(self._cfg("debug_log", False)):
             logger.debug(
@@ -641,8 +707,10 @@ class GroupAgentFlowPlugin(Star):
         async with self._lock_for(flow_id):
             context = getattr(self, "context", None)
             if context is not None:
-                conversation_id = await context.conversation_manager.get_curr_conversation_id(
-                    event.unified_msg_origin
+                conversation_id = (
+                    await context.conversation_manager.get_curr_conversation_id(
+                        event.unified_msg_origin
+                    )
                 )
                 if conversation_id:
                     await context.conversation_manager.update_conversation(

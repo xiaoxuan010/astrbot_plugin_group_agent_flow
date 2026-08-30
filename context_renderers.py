@@ -76,10 +76,14 @@ def _xml_component(component: dict[str, Any]) -> str:
         return f"<face{_xml_attrs(id=component.get('id'))}/>"
     if kind == "poke":
         return f"<poke{_xml_attrs(target_id=component.get('target_id'))}/>"
-    if kind in {"voice", "video"}:
+    if kind == "voice":
+        return "<voice/>"
+    if kind == "video":
         return f"<{kind}{_xml_attrs(url=component.get('url'))}/>"
     if kind == "file":
-        return f"<file{_xml_attrs(name=component.get('name'), url=component.get('url'))}/>"
+        return (
+            f"<file{_xml_attrs(name=component.get('name'), url=component.get('url'))}/>"
+        )
     return f"<component{_xml_attrs(type=kind or 'unknown')}/>"
 
 

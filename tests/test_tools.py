@@ -141,6 +141,7 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
         "stay_silent",
         "get_message",
         "get_image_captions",
+        "get_voice_transcript",
         "search_chat_history",
     ]
     assert tool_set.get_tool("stay_silent").parameters == {
@@ -150,9 +151,7 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
     poke_tool = tool_set.get_tool("poke_user")
     assert "current frozen message set" in poke_tool.description
     assert "snapshot" not in poke_tool.description.lower()
-    user_id_description = poke_tool.parameters["properties"]["user_id"][
-        "description"
-    ]
+    user_id_description = poke_tool.parameters["properties"]["user_id"]["description"]
     assert "current frozen message set" in user_id_description
     assert "snapshot" not in user_id_description.lower()
     react_tool = tool_set.get_tool("react_message")
@@ -182,9 +181,44 @@ def test_tool_set_exposes_only_explicit_agent_tools(tmp_path):
         "react_message",
         "get_message",
         "get_image_captions",
+        "get_voice_transcript",
     ):
         tool = tool_set.get_tool(tool_name)
-        assert 'message_id="' in tool.parameters["properties"]["message_id"]["description"]
+        assert (
+            'message_id="' in tool.parameters["properties"]["message_id"]["description"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_voice_transcript_is_snapshot_scoped_and_hides_voice_url(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {
+            "message_id": "voice-1",
+            "components": [{"type": "voice", "url": "https://private.example/a.amr"}],
+        },
+    )
+    event = FakeEvent()
+
+    class SttProvider:
+        async def get_text(self, voice_ref):
+            assert voice_ref == "https://private.example/a.amr"
+            return "语音转写结果"
+
+    context = FakeContext()
+    context.get_using_stt_provider = lambda _umo: SttProvider()
+    runtime = ToolRuntime(store, QQActionGateway(), context=context)
+    tools = runtime.build_tool_set(event)
+
+    result = await tools.get_tool("get_voice_transcript").handler(
+        event, message_id="voice-1"
+    )
+    visible = await tools.get_tool("get_message").handler(event, message_id="voice-1")
+
+    assert json.loads(result) == {"message_id": "voice-1", "transcript": "语音转写结果"}
+    assert "private.example" not in visible
+    assert json.loads(visible)["components"] == [{"type": "voice"}]
 
 
 @pytest.mark.parametrize(
@@ -231,11 +265,15 @@ def test_image_tool_visibility_hides_original_when_provider_lookup_fails(tmp_pat
         def get_using_provider(self, umo=None):
             raise ValueError("invalid session provider")
 
-    names = ToolRuntime(
-        GroupFlowStore(tmp_path),
-        QQActionGateway(),
-        context=FailingContext(),
-    ).build_tool_set(FakeEvent()).names()
+    names = (
+        ToolRuntime(
+            GroupFlowStore(tmp_path),
+            QQActionGateway(),
+            context=FailingContext(),
+        )
+        .build_tool_set(FakeEvent())
+        .names()
+    )
 
     assert "get_message_images" not in names
     assert "get_image_captions" in names
@@ -288,11 +326,15 @@ async def test_get_message_images_returns_core_multimodal_content(
         )
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool("get_message_images")
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool("get_message_images")
+    )
 
     result = await tool.handler(event, message_id="m1")
 
@@ -355,11 +397,15 @@ async def test_get_image_captions_uses_dedicated_provider(tmp_path):
         providers={"caption-provider": caption_provider},
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool("get_image_captions")
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool("get_image_captions")
+    )
 
     result = json.loads(await tool.handler(event, message_id="m1"))
 
@@ -401,23 +447,23 @@ async def test_image_tools_reject_messages_outside_snapshot(
         "napcat:group:1",
         {
             "message_id": "m2",
-            "components": [
-                {"type": "image", "url": "https://example.com/future.png"}
-            ],
+            "components": [{"type": "image", "url": "https://example.com/future.png"}],
         },
     )
     context = FakeContext(
-        using_provider=SimpleNamespace(
-            provider_config={"modalities": modalities}
-        )
+        using_provider=SimpleNamespace(provider_config={"modalities": modalities})
     )
     event = FakeEvent()
     event.extras["_group_agent_snapshot_seq"] = 1
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool(tool_name)
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool(tool_name)
+    )
 
     result = json.loads(await tool.handler(event, message_id="m2"))
 
@@ -447,16 +493,18 @@ async def test_image_tools_reject_messages_without_images(
         },
     )
     context = FakeContext(
-        using_provider=SimpleNamespace(
-            provider_config={"modalities": modalities}
-        )
+        using_provider=SimpleNamespace(provider_config={"modalities": modalities})
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool(tool_name)
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool(tool_name)
+    )
 
     result = json.loads(await tool.handler(event, message_id="m1"))
 
@@ -496,11 +544,15 @@ async def test_get_message_images_returns_compact_error_when_resolution_fails(
         )
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool("get_message_images")
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool("get_message_images")
+    )
 
     result_text = await tool.handler(event, message_id="m1")
 
@@ -513,7 +565,9 @@ async def test_get_message_images_returns_compact_error_when_resolution_fails(
 
 
 @pytest.mark.asyncio
-async def test_get_message_images_refreshes_expired_url_from_napcat(tmp_path, monkeypatch):
+async def test_get_message_images_refreshes_expired_url_from_napcat(
+    tmp_path, monkeypatch
+):
     store = GroupFlowStore(tmp_path)
     store.append_record(
         "napcat:group:1",
@@ -554,11 +608,15 @@ async def test_get_message_images_refreshes_expired_url_from_napcat(tmp_path, mo
         )
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        RefreshingGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool("get_message_images")
+    tool = (
+        ToolRuntime(
+            store,
+            RefreshingGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool("get_message_images")
+    )
 
     result = await tool.handler(event, message_id="m1")
 
@@ -579,9 +637,7 @@ async def test_get_image_captions_reports_unconfigured_provider(tmp_path):
         "napcat:group:1",
         {
             "message_id": "m1",
-            "components": [
-                {"type": "image", "url": "https://example.com/a.png"}
-            ],
+            "components": [{"type": "image", "url": "https://example.com/a.png"}],
         },
     )
     context = FakeContext(
@@ -590,11 +646,15 @@ async def test_get_image_captions_reports_unconfigured_provider(tmp_path):
         )
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool("get_image_captions")
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool("get_image_captions")
+    )
 
     result = json.loads(await tool.handler(event, message_id="m1"))
 
@@ -610,9 +670,7 @@ async def test_get_image_captions_returns_compact_error_when_config_lookup_fails
         "napcat:group:1",
         {
             "message_id": "m1",
-            "components": [
-                {"type": "image", "url": "https://example.com/a.png"}
-            ],
+            "components": [{"type": "image", "url": "https://example.com/a.png"}],
         },
     )
 
@@ -620,11 +678,15 @@ async def test_get_image_captions_returns_compact_error_when_config_lookup_fails
         def get_config(self, umo=None):
             raise RuntimeError("config contains a secret diagnostic")
 
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=FailingContext(),
-    ).build_tool_set(FakeEvent()).get_tool("get_image_captions")
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=FailingContext(),
+        )
+        .build_tool_set(FakeEvent())
+        .get_tool("get_image_captions")
+    )
 
     result_text = await tool.handler(FakeEvent(), message_id="m1")
 
@@ -663,11 +725,15 @@ async def test_get_image_captions_returns_compact_error_when_provider_fails(tmp_
         providers={"caption-provider": FailingCaptionProvider()},
     )
     event = FakeEvent()
-    tool = ToolRuntime(
-        store,
-        QQActionGateway(),
-        context=context,
-    ).build_tool_set(event).get_tool("get_image_captions")
+    tool = (
+        ToolRuntime(
+            store,
+            QQActionGateway(),
+            context=context,
+        )
+        .build_tool_set(event)
+        .get_tool("get_image_captions")
+    )
 
     result_text = await tool.handler(event, message_id="m1")
 
@@ -717,7 +783,9 @@ async def test_multiple_external_actions_execute_in_one_run(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_external_message_tool_returns_structured_result_without_finalizing(tmp_path):
+async def test_external_message_tool_returns_structured_result_without_finalizing(
+    tmp_path,
+):
     finalized = []
 
     async def finalize(event):
@@ -754,7 +822,9 @@ async def test_external_message_tool_returns_structured_result_without_finalizin
 
 
 @pytest.mark.asyncio
-async def test_external_action_allows_follow_up_provider_call_until_stay_silent(tmp_path):
+async def test_external_action_allows_follow_up_provider_call_until_stay_silent(
+    tmp_path,
+):
     store = GroupFlowStore(tmp_path)
     runtime = ToolRuntime(store, QQActionGateway())
     event = FakeEvent()
@@ -827,7 +897,9 @@ async def test_stay_silent_marks_cycle_and_returns_terminal_signal(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_external_action_returns_structured_error_and_records_failure(tmp_path):
+async def test_failed_external_action_returns_structured_error_and_records_failure(
+    tmp_path,
+):
     store = GroupFlowStore(tmp_path)
     runtime = ToolRuntime(store, QQActionGateway())
     event = FakeEvent()
@@ -918,10 +990,7 @@ async def test_action_failed_result_returns_verified_bot_mute_to_model(tmp_path)
         {
             "action_name": "send_message",
             "status": "failed",
-            "detail": (
-                "你已被禁言，无法发送消息；"
-                "解禁时间：2096-10-02T15:06:40+08:00"
-            ),
+            "detail": ("你已被禁言，无法发送消息；解禁时间：2096-10-02T15:06:40+08:00"),
         }
     ]
 
@@ -1034,13 +1103,13 @@ async def test_mute_status_query_failure_preserves_platform_diagnostic(tmp_path)
 
     assert result["error"] == "ActionFailed"
     assert result["detail"] == str(failure)
-    assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(
-        failure
-    )
+    assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(failure)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("group_state", [{}, {"group_all_shut": 0}, {"group_all_shut": "yes"}])
+@pytest.mark.parametrize(
+    "group_state", [{}, {"group_all_shut": 0}, {"group_all_shut": "yes"}]
+)
 async def test_unconfirmed_group_wide_mute_preserves_platform_diagnostic(
     tmp_path,
     group_state,
@@ -1072,7 +1141,9 @@ async def test_unconfirmed_group_wide_mute_preserves_platform_diagnostic(
     event.bot.call_action = get_mute_state
 
     result = json.loads(
-        await runtime.build_tool_set().get_tool("send_message").handler(event, content="A")
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(event, content="A")
     )
 
     assert result["detail"] == str(failure)
@@ -1111,7 +1182,9 @@ async def test_group_mute_status_query_failure_preserves_platform_diagnostic(tmp
     event.bot.call_action = get_mute_state
 
     result = json.loads(
-        await runtime.build_tool_set().get_tool("send_message").handler(event, content="A")
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(event, content="A")
     )
 
     assert result["detail"] == str(failure)
@@ -1151,9 +1224,7 @@ async def test_invalid_mute_timestamp_preserves_platform_diagnostic(tmp_path):
     )
 
     assert result["detail"] == str(failure)
-    assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(
-        failure
-    )
+    assert event.get_extra("_group_agent_external_actions")[0]["detail"] == str(failure)
 
 
 @pytest.mark.asyncio
@@ -1197,9 +1268,13 @@ async def test_action_success_does_not_create_legacy_fact_after_send(tmp_path):
     )
     event = FakeEvent()
 
-    result = await runtime.build_tool_set().get_tool("send_message").handler(
-        event,
-        content="A",
+    result = (
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(
+            event,
+            content="A",
+        )
     )
 
     assert result == '{"success":true,"action":"send_message"}'
@@ -1235,9 +1310,13 @@ async def test_action_success_ignores_legacy_action_persistence_callback(tmp_pat
     )
     event = FakeEvent()
 
-    result = await runtime.build_tool_set().get_tool("send_message").handler(
-        event,
-        content="A",
+    result = (
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(
+            event,
+            content="A",
+        )
     )
 
     assert result == '{"success":true,"action":"send_message"}'
@@ -1273,9 +1352,13 @@ async def test_stale_run_is_rejected_before_external_gateway_call(tmp_path):
     )
     event = FakeEvent()
 
-    result = await runtime.build_tool_set().get_tool("send_message").handler(
-        event,
-        content="stale",
+    result = (
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(
+            event,
+            content="stale",
+        )
     )
 
     assert result == '{"success":false,"action":"send_message","error":"stale_run"}'
@@ -1314,9 +1397,13 @@ async def test_admitted_gateway_action_has_no_legacy_fact_write(
     )
     event = FakeEvent()
 
-    result = await runtime.build_tool_set().get_tool("send_message").handler(
-        event,
-        content="already admitted",
+    result = (
+        await runtime.build_tool_set()
+        .get_tool("send_message")
+        .handler(
+            event,
+            content="already admitted",
+        )
     )
 
     assert result == '{"success":true,"action":"send_message"}'
@@ -1398,9 +1485,10 @@ async def test_history_tools_hide_internal_image_source_urls_from_model(tmp_path
     assert json.loads(message)["components"] == [
         {"type": "image", "url": "C:/AstrBot/temp/image.png"}
     ]
-    assert store.get_message("napcat:group:1", "m1")["components"][0][
-        "source_url"
-    ] == source_url
+    assert (
+        store.get_message("napcat:group:1", "m1")["components"][0]["source_url"]
+        == source_url
+    )
 
 
 @pytest.mark.asyncio
@@ -1457,9 +1545,10 @@ async def test_poke_user_only_targets_users_observed_in_frozen_snapshot(tmp_path
     tools = ToolRuntime(store, QQActionGateway()).build_tool_set()
 
     for user_id in ("alice", "bob", "carol"):
-        assert await tools.get_tool("poke_user").handler(
-            event, user_id=user_id
-        ) == '{"success":true,"action":"poke_user"}'
+        assert (
+            await tools.get_tool("poke_user").handler(event, user_id=user_id)
+            == '{"success":true,"action":"poke_user"}'
+        )
     rejected = json.loads(
         await tools.get_tool("poke_user").handler(event, user_id="future")
     )

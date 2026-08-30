@@ -2,7 +2,12 @@ import pytest
 from astrbot.core.agent.context.token_counter import EstimateTokenCounter
 from astrbot.core.agent.message import Message
 
-from observation import _truncate_single_record, prepare_observation
+from observation import (
+    AudioAttachment,
+    _truncate_single_record,
+    prepare_observation,
+    prepare_observation_records,
+)
 from store import GroupFlowStore
 
 
@@ -194,3 +199,30 @@ def test_prepare_observation_ignores_transport_events_without_model_content(tmp_
     assert prepared.source_seqs == ()
     assert prepared.target_cursor == 1
     assert prepared.estimated_tokens == 0
+
+
+def test_observation_counts_audio_and_keeps_only_selected_voice_urls():
+    records = [
+        {**_record("old", "old"), "seq": 1},
+        {**_record("new", "new"), "seq": 2},
+    ]
+    baseline = prepare_observation_records(
+        records,
+        snapshot_seq=2,
+        max_context_tokens=8192,
+    )
+    prepared = prepare_observation_records(
+        records,
+        snapshot_seq=2,
+        max_context_tokens=baseline.estimated_tokens + 10,
+        audio_attachments=(
+            AudioAttachment(
+                seq=1, url="https://private.example/old.amr", token_cost=20
+            ),
+            AudioAttachment(seq=2, url="https://private.example/new.amr", token_cost=5),
+        ),
+    )
+
+    assert prepared.source_seqs == (2,)
+    assert prepared.audio_urls == ("https://private.example/new.amr",)
+    assert prepared.estimated_tokens <= baseline.estimated_tokens + 10

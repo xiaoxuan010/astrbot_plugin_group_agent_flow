@@ -46,13 +46,8 @@ class ToolRuntime:
         store: GroupFlowStore,
         gateway: QQActionGateway,
         terminal_callback: Callable[[Any], Awaitable[None]] | None = None,
-        action_persist_callback: Callable[
-            ..., Awaitable[int]
-        ]
-        | None = None,
-        action_admission_callback: Callable[
-            [str, str, int], Awaitable[bool]
-        ]
+        action_persist_callback: Callable[..., Awaitable[int]] | None = None,
+        action_admission_callback: Callable[[str, str, int], Awaitable[bool]]
         | None = None,
         context: Any | None = None,
     ) -> None:
@@ -152,8 +147,10 @@ class ToolRuntime:
                     return True
         return False
 
-    def _current_provider_supports_images(self, event: Any | None) -> bool:
-        """仅接受当前会话 Provider 显式声明的图片能力。"""
+    def _current_provider_supports_modality(
+        self, event: Any | None, modality: str
+    ) -> bool:
+        """仅接受 Provider 显式声明的当前会话模态能力。"""
         if self.context is None or event is None:
             return False
         try:
@@ -170,7 +167,15 @@ class ToolRuntime:
         if not isinstance(provider_config, dict):
             return False
         modalities = provider_config.get("modalities")
-        return isinstance(modalities, list) and "image" in modalities
+        return isinstance(modalities, list) and modality in modalities
+
+    def _current_provider_supports_images(self, event: Any | None) -> bool:
+        """仅接受当前会话 Provider 显式声明的图片能力。"""
+        return self._current_provider_supports_modality(event, "image")
+
+    def _current_provider_supports_audio(self, event: Any | None) -> bool:
+        """仅接受当前会话 Provider 显式声明的语音能力。"""
+        return self._current_provider_supports_modality(event, "audio")
 
     @staticmethod
     def _message_image_refs(record: dict[str, Any]) -> list[str]:
@@ -188,13 +193,29 @@ class ToolRuntime:
         return refs
 
     @staticmethod
+    def _message_voice_refs(record: dict[str, Any]) -> list[str]:
+        """按组件顺序返回内部语音引用。"""
+        components = record.get("components")
+        if not isinstance(components, list):
+            return []
+        return [
+            str(component.get("url") or "")
+            for component in components
+            if isinstance(component, dict)
+            and component.get("type") == "voice"
+            and component.get("url")
+        ]
+
+    @staticmethod
     def _model_visible_record(record: dict[str, Any]) -> dict[str, Any]:
-        """移除仅供插件内部下载图片使用的记录字段。"""
+        """从模型可见记录中移除内部媒体引用。"""
         projected = dict(record)
         components = record.get("components")
         if isinstance(components, list):
             projected["components"] = [
-                {
+                {"type": "voice"}
+                if isinstance(component, dict) and component.get("type") == "voice"
+                else {
                     key: value
                     for key, value in component.items()
                     if key != "source_url"
@@ -362,7 +383,7 @@ class ToolRuntime:
             )
 
         async def stay_silent(event: Any) -> None:
-            """End this observation cycle without a group-visible action."""
+            """结束本轮观察而不产生群可见动作。"""
             self._run_metadata(event)
             event.set_extra(SILENCE_SELECTED_EXTRA, True)
             if self.terminal_callback is not None:
@@ -457,6 +478,7 @@ class ToolRuntime:
                         )
                     )
                 return CallToolResult(content=content)
+
             try:
                 return await build_image_result(image_refs)
             except Exception as initial_exc:
@@ -561,6 +583,54 @@ class ToolRuntime:
                     }
                 )
 
+        async def get_voice_transcript(event: Any, message_id: str) -> str:
+            """转写冻结快照中某条消息的语音附件。"""
+            _, flow_id, snapshot_seq, _ = self._run_metadata(event)
+            batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
+            record = self._message_in_snapshot(
+                flow_id,
+                message_id,
+                snapshot_seq,
+                batch_id,
+            )
+            if record is None:
+                return _json(
+                    {
+                        "error": "message_not_found_in_snapshot",
+                        "message_id": message_id,
+                    }
+                )
+            voice_refs = self._message_voice_refs(record)
+            if not voice_refs:
+                return _json(
+                    {
+                        "error": "message_contains_no_voice",
+                        "message_id": message_id,
+                    }
+                )
+            if self.context is None:
+                return _json({"error": "stt_unavailable", "message_id": message_id})
+            try:
+                stt_provider = self.context.get_using_stt_provider(
+                    event.unified_msg_origin
+                )
+                if stt_provider is None:
+                    return _json({"error": "stt_unavailable", "message_id": message_id})
+                transcripts = [
+                    str(await stt_provider.get_text(voice_ref) or "").strip()
+                    for voice_ref in voice_refs
+                ]
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] voice transcription failed "
+                    f"message_id={message_id} error={type(exc).__name__}"
+                )
+                return _json({"error": "stt_failed", "message_id": message_id})
+            transcript = "\n".join(part for part in transcripts if part)
+            if not transcript:
+                return _json({"error": "stt_failed", "message_id": message_id})
+            return _json({"message_id": message_id, "transcript": transcript})
+
         async def search_chat_history(
             event: Any,
             query: str = "",
@@ -585,118 +655,117 @@ class ToolRuntime:
             return _json(
                 {
                     "messages": [
-                        self._model_visible_record(message)
-                        for message in messages
+                        self._model_visible_record(message) for message in messages
                     ]
                 }
             )
 
         string_array = {"type": "array", "items": {"type": "string"}}
         tools = [
-                FunctionTool(
-                    name="send_message",
-                    description="Send one message to the current group.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string", "maxLength": 500},
-                            "mentions": string_array,
-                        },
-                        "required": ["content"],
+            FunctionTool(
+                name="send_message",
+                description="Send one message to the current group.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "maxLength": 500},
+                        "mentions": string_array,
                     },
-                    handler=send_message,
-                ),
-                FunctionTool(
-                    name="reply_message",
-                    description="Reply to a specific observed group message by message ID.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "message_id": {
-                                "type": "string",
-                                "description": MESSAGE_ID_DESCRIPTION,
-                            },
-                            "content": {"type": "string", "maxLength": 500},
-                            "mentions": string_array,
+                    "required": ["content"],
+                },
+                handler=send_message,
+            ),
+            FunctionTool(
+                name="reply_message",
+                description="Reply to a specific observed group message by message ID.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": MESSAGE_ID_DESCRIPTION,
                         },
-                        "required": ["message_id", "content"],
+                        "content": {"type": "string", "maxLength": 500},
+                        "mentions": string_array,
                     },
-                    handler=reply_message,
-                ),
-                FunctionTool(
-                    name="react_message",
-                    description="Add a QQ emoji reaction to a specific observed message.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "message_id": {
-                                "type": "string",
-                                "description": MESSAGE_ID_DESCRIPTION,
-                            },
-                            "reaction": {
-                                "type": "string",
-                                "enum": list(SUPPORTED_REACTIONS),
-                                "description": "要添加到消息上的 QQ 表情名称。",
-                            },
+                    "required": ["message_id", "content"],
+                },
+                handler=reply_message,
+            ),
+            FunctionTool(
+                name="react_message",
+                description="Add a QQ emoji reaction to a specific observed message.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": MESSAGE_ID_DESCRIPTION,
                         },
-                        "required": ["message_id", "reaction"],
-                    },
-                    handler=react_message,
-                ),
-                FunctionTool(
-                    name="poke_user",
-                    description="Poke one QQ user observed in the current frozen message set.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "user_id": {
-                                "type": "string",
-                                "description": "Exact QQ user ID observed as a sender, mention, or poke target in the current frozen message set.",
-                            }
-                        },
-                        "required": ["user_id"],
-                    },
-                    handler=poke_user,
-                ),
-                FunctionTool(
-                    name="stay_silent",
-                    description="End the current observation cycle without any group-visible action.",
-                    parameters={"type": "object", "properties": {}},
-                    handler=stay_silent,
-                ),
-                FunctionTool(
-                    name="get_message",
-                    description="Read one locally stored group message by message ID.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "message_id": {
-                                "type": "string",
-                                "description": MESSAGE_ID_DESCRIPTION,
-                            }
-                        },
-                        "required": ["message_id"],
-                    },
-                    handler=get_message,
-                ),
-                FunctionTool(
-                    name="search_chat_history",
-                    description=(
-                        "Search messages in the current frozen Buffer snapshot; "
-                        "historical QQ search is provided separately."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "sender_id": {"type": "string"},
-                            "since": {"type": ["integer", "null"]},
-                            "until": {"type": ["integer", "null"]},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "reaction": {
+                            "type": "string",
+                            "enum": list(SUPPORTED_REACTIONS),
+                            "description": "要添加到消息上的 QQ 表情名称。",
                         },
                     },
-                    handler=search_chat_history,
+                    "required": ["message_id", "reaction"],
+                },
+                handler=react_message,
+            ),
+            FunctionTool(
+                name="poke_user",
+                description="Poke one QQ user observed in the current frozen message set.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": "Exact QQ user ID observed as a sender, mention, or poke target in the current frozen message set.",
+                        }
+                    },
+                    "required": ["user_id"],
+                },
+                handler=poke_user,
+            ),
+            FunctionTool(
+                name="stay_silent",
+                description="End the current observation cycle without any group-visible action.",
+                parameters={"type": "object", "properties": {}},
+                handler=stay_silent,
+            ),
+            FunctionTool(
+                name="get_message",
+                description="Read one locally stored group message by message ID.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": MESSAGE_ID_DESCRIPTION,
+                        }
+                    },
+                    "required": ["message_id"],
+                },
+                handler=get_message,
+            ),
+            FunctionTool(
+                name="search_chat_history",
+                description=(
+                    "Search messages in the current frozen Buffer snapshot; "
+                    "historical QQ search is provided separately."
                 ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "sender_id": {"type": "string"},
+                        "since": {"type": ["integer", "null"]},
+                        "until": {"type": ["integer", "null"]},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+                handler=search_chat_history,
+            ),
         ]
         if self._current_provider_supports_images(event):
             tools.insert(
@@ -734,6 +803,25 @@ class ToolRuntime:
                         "required": ["message_id"],
                     },
                     handler=get_image_captions,
+                ),
+            )
+        if not self._current_provider_supports_audio(event):
+            tools.insert(
+                -1,
+                FunctionTool(
+                    name="get_voice_transcript",
+                    description="Transcribe voice attachments from one observed group message.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": MESSAGE_ID_DESCRIPTION,
+                            }
+                        },
+                        "required": ["message_id"],
+                    },
+                    handler=get_voice_transcript,
                 ),
             )
         return ToolSet(tools)

@@ -3,6 +3,6 @@ display_name: Group Agent Flow
 desc: Snapshot-driven autonomous QQ group agent with tool-only external actions and XML delta-block group context.
 version: v0.1.0
 author: Tsukumi233 and contributors
-astrbot_version: ">=4.9.2"
+astrbot_version: ">=4.27.4"
 support_platforms:
   - aiocqhttp

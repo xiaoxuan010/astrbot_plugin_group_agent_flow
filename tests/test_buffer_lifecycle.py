@@ -20,6 +20,7 @@ from astrbot_plugin_group_agent_flow.main import (  # noqa: E402
     AUTONOMOUS_EXTRA,
     GroupAgentFlowPlugin,
 )
+from astrbot_plugin_group_agent_flow.observation import AudioAttachment  # noqa: E402
 from astrbot_plugin_group_agent_flow.coordinator import GroupRunCoordinator  # noqa: E402
 from astrbot_plugin_group_agent_flow.store import GroupFlowStore  # noqa: E402
 
@@ -96,6 +97,60 @@ async def test_inject_snapshot_only_projects_claimed_rows(tmp_path):
     )
     assert batch.batch_id not in json.dumps(request.contexts)
     assert request.func_tool == "tools"
+
+
+@pytest.mark.asyncio
+async def test_inject_snapshot_attaches_only_budget_selected_audio(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    voice_record = {
+        **_record("voice-1", "voice"),
+        "components": [{"type": "voice", "url": "https://private.example/a.amr"}],
+    }
+    store.append_pending("qq:group:1", voice_record)
+    batch = store.claim_batch("qq:group:1", 1)
+    assert batch is not None
+
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.store = store
+    plugin.config = {"context": {"max_context_tokens": 8192}}
+    plugin._locks = {}
+    plugin.coordinator = SimpleNamespace(is_run_current=lambda *_args, **_kwargs: True)
+    plugin.context = SimpleNamespace(
+        get_using_provider=lambda _umo: SimpleNamespace(
+            provider_config={"modalities": ["text", "audio"]}
+        )
+    )
+    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda _event: "tools")
+
+    async def attachments(records):
+        assert records == list(batch.records)
+        return (
+            AudioAttachment(seq=1, url="https://private.example/a.amr", token_cost=1),
+        )
+
+    plugin._resolve_voice_attachments = attachments
+    event = _Event(
+        {
+            AUTONOMOUS_EXTRA: True,
+            FLOW_ID_EXTRA: "qq:group:1",
+            RUN_ID_EXTRA: "run-1",
+            RUN_GENERATION_EXTRA: 0,
+            SNAPSHOT_SEQ_EXTRA: batch.snapshot_seq,
+            BATCH_ID_EXTRA: batch.batch_id,
+            BATCH_RECORDS_EXTRA: list(batch.records),
+        }
+    )
+    request = SimpleNamespace(
+        conversation=SimpleNamespace(cid="conv", token_usage=0),
+        contexts=[],
+        func_tool=None,
+        audio_urls=[],
+    )
+
+    await plugin.inject_snapshot(event, request)
+
+    assert request.audio_urls == ["https://private.example/a.amr"]
+    assert "private.example" not in request.contexts[-1]["content"]
 
 
 @pytest.mark.asyncio

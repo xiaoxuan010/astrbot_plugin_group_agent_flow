@@ -25,8 +25,8 @@ tool that invokes the terminal callback and returns `None`.
 Use exceptions for invalid internal state and unsupported capabilities:
 
 - `GroupRunCoordinator.finish()` raises `KeyError` for an unknown run.
-- `build_renderer()` always returns the fixed XML delta renderer; renderer selection is not a
-  runtime configuration or error path.
+- `build_renderer(name)` falls back to the XML delta renderer for unknown names instead of
+  raising; renderer selection is a configuration value, not an error path.
 - `QQActionGateway` raises `ValueError` for missing owner configuration and `RuntimeError`
   when the current platform lacks a required QQ API.
 - Observation preparation raises `ValueError` when `max_context_tokens` cannot contain the

@@ -29,6 +29,7 @@ from astrbot_plugin_group_agent_flow.coordinator import (  # noqa: E402
 import astrbot_plugin_group_agent_flow.main as main_module  # noqa: E402
 from astrbot_plugin_group_agent_flow.main import (  # noqa: E402
     AUTONOMOUS_EXTRA,
+    CHAT_LEGEND,
     GroupAgentFlowPlugin,
     RUN_CONTEXT_EXTRA,
 )
@@ -115,7 +116,10 @@ async def test_agent_done_compacts_tool_images_before_history_save():
         SimpleNamespace(completion_text="", result_chain=None),
     )
 
-    assert run_context.messages[0].content == '{"message_id":"m1","caption":"一张部署截图"}'
+    assert (
+        run_context.messages[0].content
+        == '{"message_id":"m1","caption":"一张部署截图"}'
+    )
     assert run_context.messages[1].content == [
         TextPart(
             text=(
@@ -187,6 +191,26 @@ def test_system_prompt_requires_tools_without_duplicating_tool_names():
         "search_chat_history",
     ):
         assert tool_name not in prompt
+
+
+def test_system_prompt_appends_legend_only_for_line_messages_renderer():
+    """renderer='line_messages' 时附加省略语义图例；xml_delta 时不附加。"""
+    xml_plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    xml_plugin.config = {"context": {"renderer": "xml_delta"}}
+    assert CHAT_LEGEND not in xml_plugin._system_prompt()
+
+    line_plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    line_plugin.config = {"context": {"renderer": "line_messages"}}
+    prompt = line_plugin._system_prompt()
+    assert CHAT_LEGEND in prompt
+    assert "Use available tools for every group-visible message or action" in prompt
+
+
+def test_system_prompt_defaults_to_no_legend():
+    """未配置 renderer 时（默认 xml_delta）不附加图例。"""
+    plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
+    plugin.config = {}
+    assert CHAT_LEGEND not in plugin._system_prompt()
 
 
 @pytest.mark.parametrize(
@@ -376,7 +400,11 @@ async def test_enforce_autonomous_tools_builds_tools_for_current_event(monkeypat
     event = FakeEvent({AUTONOMOUS_EXTRA: True})
     request = ProviderRequest(prompt="review", contexts=[], func_tool="old")
     event.set_extra("provider_request", request)
-    monkeypatch.setattr(main_module, "enforce_tool_set", lambda req, tools: setattr(req, "func_tool", tools))
+    monkeypatch.setattr(
+        main_module,
+        "enforce_tool_set",
+        lambda req, tools: setattr(req, "func_tool", tools),
+    )
 
     await plugin.enforce_autonomous_tools(event, None)
 
@@ -410,10 +438,7 @@ async def test_finalize_agent_protocol_removes_core_tool_prompts_for_autonomous_
         prompt="review",
         contexts=[],
         system_prompt=(
-            "persona\n"
-            + TOOL_CALL_PROMPT
-            + "\n"
-            + TOOL_CALL_PROMPT_SKILLS_LIKE_MODE
+            "persona\n" + TOOL_CALL_PROMPT + "\n" + TOOL_CALL_PROMPT_SKILLS_LIKE_MODE
         ),
     )
 

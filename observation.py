@@ -65,6 +65,11 @@ def _count_contexts(
     return counter.count_tokens(messages)
 
 
+def _build_renderer(renderer_name: str) -> ContextRenderer:
+    """按配置构造渲染器；未知名称回退到 XML 增量块。"""
+    return build_renderer(renderer_name or "xml_delta")
+
+
 def _render_block(
     renderer: ContextRenderer,
     records: list[dict[str, Any]] | tuple[dict[str, Any], ...],
@@ -181,6 +186,7 @@ def prepare_observation(
     max_context_tokens: int,
     history_cursor: int | None = None,
     audio_attachments: tuple[AudioAttachment, ...] = (),
+    renderer_name: str = "xml_delta",
 ) -> PreparedObservation:
     """构建仍在 Buffer 中的 observation 增量。"""
     all_records = store.get_range(flow_id, 1, int(snapshot_seq))
@@ -190,6 +196,7 @@ def prepare_observation(
         max_context_tokens=max_context_tokens,
         history_cursor=history_cursor,
         audio_attachments=audio_attachments,
+        renderer_name=renderer_name,
     )
 
 
@@ -200,10 +207,11 @@ def prepare_observation_records(
     max_context_tokens: int,
     history_cursor: int | None = None,
     audio_attachments: tuple[AudioAttachment, ...] = (),
+    renderer_name: str = "xml_delta",
 ) -> PreparedObservation:
     """渲染恰好给定的不可变批次行，不做任何存储读取。"""
     cursor = max(0, int(history_cursor)) if history_cursor is not None else 0
-    renderer = build_renderer()
+    renderer = _build_renderer(renderer_name)
     counter = EstimateTokenCounter()
     hard_limit = max(1, int(max_context_tokens))
 

@@ -148,6 +148,149 @@ class XmlDeltaRenderer:
         ]
 
 
-def build_renderer() -> ContextRenderer:
-    """创建唯一支持的 XML 增量块 renderer。"""
-    return XmlDeltaRenderer()
+class _LineState:
+    """行式布局在块内继承的状态：当前日期、分钟、上一条发送者。"""
+
+    __slots__ = ("date", "minute", "sender_id")
+
+    def __init__(self) -> None:
+        self.date: str | None = None
+        self.minute: str | None = None
+        self.sender_id: str | None = None
+
+
+def _line_time_prefix(dt: datetime, state: _LineState) -> str:
+    """[YYYY/MM/DD HH:MM] / [HH:MM] / ''（同分钟省略）。"""
+    date_part = dt.strftime("%Y/%m/%d")
+    time_part = dt.strftime("%H:%M")
+    if state.date != date_part:
+        state.date, state.minute = date_part, time_part
+        return f"[{date_part} {time_part}]\n"
+    if state.minute != time_part:
+        state.minute = time_part
+        return f"[{time_part}]\n"
+    return ""
+
+
+def _line_quote_prefix(component: dict[str, Any]) -> str:
+    """引用前缀：> 完整日期 #被引ID: (QQ号)昵称: 预览 /。"""
+    qid = _one_line(component.get("message_id"))
+    who = _one_line(component.get("sender_name")) or _one_line(
+        component.get("sender_id")
+    )
+    uid = _one_line(component.get("sender_id"))
+    text = _one_line(component.get("text"))
+    preview = (text[:20] + "…") if len(text) > 20 else text
+    ts = component.get("timestamp")
+    stamp = ""
+    if ts:
+        stamp = f"{_datetime(ts).strftime('%Y/%m/%d %H:%M')} "
+    idpart = f"#{qid}: " if qid else ""
+    upart = f"({uid})" if uid else ""
+    return f"> {stamp}{idpart}{upart}{who}: {preview} / "
+
+
+def _line_render_components(components: list, reply_state: dict) -> str:
+    """渲染行式正文组件。reply_state 收集 reply 信息供行前缀使用。"""
+    parts = []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        kind = _one_line(component.get("type"))
+        if kind == "text":
+            parts.append(_one_line(component.get("text")))
+        elif kind == "reply":
+            reply_state["prefix"] = _line_quote_prefix(component)
+        elif kind == "at":
+            name = _one_line(component.get("name"))
+            uid = _one_line(component.get("user_id"))
+            if uid == "all":
+                parts.append("@全体成员")
+            else:
+                parts.append(f"@{name or uid}")
+        elif kind == "image":
+            url = _one_line(component.get("url") or "")
+            tail = url.rsplit("/", 1)[-1][:12] if url else ""
+            parts.append(f"[图片:{tail}]" if tail else "[图片]")
+        elif kind == "face":
+            parts.append(f"[表情:{_one_line(component.get('id'))}]")
+        elif kind == "poke":
+            parts.append("[戳一戳]")
+        elif kind == "voice":
+            parts.append("[语音]")
+        elif kind == "video":
+            parts.append("[视频]")
+        elif kind == "file":
+            parts.append(f"[文件:{_one_line(component.get('name'))}]")
+        else:
+            parts.append(f"[{_one_line(kind) or '未知'}]")
+    return " ".join(p for p in parts if p)
+
+
+class LineMessagesRenderer:
+    """行式消息增量块：每条消息一行，紧凑省略式。
+
+    格式规格（研究结论中最优变体）：
+      [YYYY/MM/DD HH:MM] (QQ号)昵称: 正文  #消息ID
+      - 同分钟省略时间段，跨天恢复完整日期
+      - 同人连续发言省略「(QQ号)昵称: 」整段
+      - 消息 ID 永不省略，作为 reply/react/get_message 的定位锚点
+      - 引用前缀带完整日期 + #被引消息ID，供 get_message 按需取原文
+    """
+
+    name = "line_messages"
+
+    def __init__(self) -> None:
+        """构造行式渲染器。"""
+        self._state = _LineState()
+
+    def _render_record(self, event: dict[str, Any]) -> str:
+        dt = _datetime(event.get("timestamp"))
+        sender_id = _one_line(event.get("sender_id"))
+        sender_name = _one_line(event.get("sender_name")) or sender_id
+        message_id = _one_line(event.get("message_id"))
+
+        time_prefix = _line_time_prefix(dt, self._state)
+
+        # 同人连发：省略「(QQ号)昵称: 」整段
+        same_as_prev = bool(sender_id) and sender_id == self._state.sender_id
+        who = "" if same_as_prev else f"({sender_id}){sender_name}: "
+
+        reply_state: dict = {}
+        components = event.get("components")
+        body = _line_render_components(
+            components
+            if isinstance(components, list) and components
+            else [{"type": "text", "text": event.get("text")}],
+            reply_state,
+        )
+
+        line = f"{reply_state.get('prefix', '')}{who}{body}"
+        if message_id:
+            line += f"  #{message_id}"
+        self._state.sender_id = sender_id or self._state.sender_id
+        return time_prefix + line
+
+    def render(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """按事件顺序返回单个 user 消息块。"""
+        if not events:
+            return []
+        group_name = _one_line(_first_nonempty(events, "group_name"))
+        header = f"【{group_name}】新消息：" if group_name else "新消息："
+        self._state = _LineState()
+        lines = [self._render_record(e) for e in events]
+        return [{"role": "user", "content": header + "\n" + "\n".join(lines)}]
+
+
+_RENDERERS: dict[str, type[ContextRenderer]] = {
+    XmlDeltaRenderer.name: XmlDeltaRenderer,
+    LineMessagesRenderer.name: LineMessagesRenderer,
+}
+
+
+def build_renderer(name: str = "xml_delta") -> ContextRenderer:
+    """按名称创建渲染器；未知名称回退到 XML 增量块。"""
+    renderer_type = _RENDERERS.get(name)
+    if renderer_type is None:
+        return XmlDeltaRenderer()
+    return renderer_type()

@@ -1,7 +1,7 @@
 {
   "metadata": {
     "display_name": "群聊自主智能体 Flow",
-    "desc": "基于固定快照驱动的 QQ 群聊自主智能体，所有对外动作均通过工具调用，并使用 XML 增量块传递群聊上下文。"
+    "desc": "基于固定快照驱动的 QQ 群聊自主智能体，所有对外动作均通过工具调用，并使用增量消息块组织群聊上下文。"
   },
   "config": {
     "agent_settings": {
@@ -49,6 +49,11 @@
       "record_empty_messages": {
         "description": "无内容事件的旧配置兼容项",
         "hint": "无内容传输事件不会写入 SQLite Buffer，也不会发送给模型。"
+      },
+      "renderer": {
+        "description": "观察上下文渲染格式",
+        "hint": "XML 增量块（结构化组件）：单个 <group_messages_delta>，外层携带群元数据，内部按 XML 组件表达事件。行式消息：每条消息一行，紧凑省略式 [YYYY/MM/DD HH:MM] (QQ号)昵称: 正文 #消息编号，长上下文更省 token。",
+        "labels": ["XML 增量块（结构化组件）", "行式消息"]
       }
     },
     "prompt": {

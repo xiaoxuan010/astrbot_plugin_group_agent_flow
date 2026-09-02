@@ -17,9 +17,7 @@ def test_plugin_i18n_covers_metadata_and_configuration_schema():
     schema = _load_json(ROOT / "_conf_schema.json")
 
     for locale in LOCALES:
-        resource = _load_json(
-            ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
-        )
+        resource = _load_json(ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json")
         assert set(resource["metadata"]) >= {"display_name", "desc"}
         assert resource["metadata"]["display_name"]
         assert resource["metadata"]["desc"]
@@ -34,20 +32,24 @@ def test_plugin_i18n_covers_metadata_and_configuration_schema():
                 if "hint" in item_schema:
                     assert localized_item["hint"]
                 if "labels" in item_schema:
-                    assert len(localized_item["labels"]) == len(
-                        item_schema["options"]
-                    )
+                    assert len(localized_item["labels"]) == len(item_schema["options"])
 
 
-def test_context_renderer_is_not_user_configurable():
+def test_renderer_options_and_labels_remain_aligned():
+    """renderer 配置项是 string 下拉，options/labels/i18n 对齐。"""
     schema = _load_json(ROOT / "_conf_schema.json")
-    assert "renderer" not in schema["context"]["items"]
+    renderer = schema["context"]["items"]["renderer"]
+    assert renderer["type"] == "string"
+    assert renderer["options"] == ["xml_delta", "line_messages"]
+    assert renderer["default"] == "xml_delta"
+    assert len(renderer["labels"]) == len(renderer["options"])
 
     for locale in LOCALES:
-        resource = _load_json(
-            ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
-        )
-        assert "renderer" not in resource["config"]["context"]
+        resource = _load_json(ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json")
+        localized = resource["config"]["context"]["renderer"]
+        assert localized["description"]
+        assert localized["hint"]
+        assert len(localized["labels"]) == len(renderer["options"])
 
 
 def test_context_window_uses_token_budget_and_cache_retention_settings():
@@ -61,16 +63,12 @@ def test_context_window_uses_token_budget_and_cache_retention_settings():
 
 def test_directed_cycle_interval_schema_contract():
     schema = _load_json(ROOT / "_conf_schema.json")
-    item = schema["scheduling"]["items"][
-        "direct_min_cycle_interval_seconds"
-    ]
+    item = schema["scheduling"]["items"]["direct_min_cycle_interval_seconds"]
     assert item["type"] == "float"
     assert item["default"] == 20.0
 
     for locale in LOCALES:
-        resource = _load_json(
-            ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
-        )
+        resource = _load_json(ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json")
         localized = resource["config"]["scheduling"][
             "direct_min_cycle_interval_seconds"
         ]

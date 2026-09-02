@@ -73,8 +73,9 @@ final cross-thread boundary.
 ## Historical architecture notes (archival; not implementation requirements)
 
 The following records preserve prior JSONL/cursor/action-fact design discussions. They may explain old
-commits, but new runtime code must follow the SQLite Buffer contract above and must not restore a renderer
-configuration, JSONL persistence, or local `agent_action` facts.
+commits, but new runtime code must follow the SQLite Buffer contract above and must not restore
+JSONL persistence or local `agent_action` facts. The renderer configuration is current again but
+limited to `xml_delta` and `line_messages`.
 
 ### Core multi-role history paired with JSONL deltas
 
@@ -286,13 +287,17 @@ the unified finalizer commit state for the same generation.
 
 ### 1. Scope / Trigger
 
-The fixed XML delta renderer projects one frozen observation into one XML `role=user` block. The projection
-consumes persisted SQLite Buffer `components`, so component fields are a storage-to-provider contract.
+The `xml_delta` renderer (default) projects one frozen observation into one XML `role=user` block. The
+projection consumes persisted SQLite Buffer `components`, so component fields are a storage-to-provider
+contract. The alternative `line_messages` renderer projects the same records as compact per-line text
+(`[YYYY/MM/DD HH:MM] (QQ号)昵称: 正文 #message_id`) with same-minute/same-sender omission semantics.
 
 ### 2. Signatures
 
 - `_component_record(component) -> dict[str, Any]`
 - `XmlDeltaRenderer.render(events: list[dict[str, Any]]) -> list[dict[str, Any]]`
+- `LineMessagesRenderer.render(events: list[dict[str, Any]]) -> list[dict[str, Any]]`
+- `build_renderer(name: str = "xml_delta") -> ContextRenderer`
 
 ### 3. Contracts
 

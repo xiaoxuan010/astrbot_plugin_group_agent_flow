@@ -91,6 +91,13 @@ OBSERVATION_CYCLE_PROMPT = """
 Review the recent group chat and complete this cycle through the appropriate tool calls.
 """.strip()
 
+# 行式消息格式图例（在行式格式下附加到 system prompt 末尾）
+CHAT_LEGEND = (
+    "消息格式：[YYYY/MM/DD HH:MM] (QQ号)昵称: 正文 #消息编号；"
+    "省略时间戳表示与上一条同一分钟，省略昵称段表示与上一条是同一个人；"
+    "行尾#编号用于回复时传入 message_id。"
+).strip()
+
 
 def _place_agent_protocol_last(system_prompt: str | None) -> str:
     """移除 Core 工具提示，并将固定动作协议去重后放到末尾。"""
@@ -124,6 +131,7 @@ CONFIG_PATHS = {
     "max_text_chars": ("context", "max_text_chars"),
     "record_self_messages": ("context", "record_self_messages"),
     "record_empty_messages": ("context", "record_empty_messages"),
+    "context_renderer": ("context", "renderer"),
     "custom_system_prompt": ("prompt", "custom_system_prompt"),
     "debug_log": ("debug", "debug_log"),
 }
@@ -140,6 +148,7 @@ CONFIG_DEFAULTS = {
     "max_text_chars": 4000,
     "record_self_messages": False,
     "record_empty_messages": True,
+    "context_renderer": "xml_delta",
     "custom_system_prompt": "",
     "debug_log": False,
 }
@@ -420,11 +429,20 @@ class GroupAgentFlowPlugin(Star):
         )
 
     def _system_prompt(self) -> str:
-        """在可选人格提示词后附加固定动作协议。"""
+        """在可选人格提示词后附加固定动作协议。
+
+        行式消息渲染格式下，再附加一行省略语义图例（静态前缀，一次性成本）。
+        """
         custom = str(self._cfg("custom_system_prompt", "") or "").strip()
-        return (
+        base = (
             f"{custom}\n\n{AGENT_PROTOCOL_PROMPT}" if custom else AGENT_PROTOCOL_PROMPT
         )
+        if (
+            str(self._cfg("context_renderer", "xml_delta") or "xml_delta")
+            == "line_messages"
+        ):
+            return f"{base}\n\n{CHAT_LEGEND}"
+        return base
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
@@ -547,6 +565,9 @@ class GroupAgentFlowPlugin(Star):
                 snapshot_seq=snapshot_seq,
                 max_context_tokens=int(self._cfg("max_context_tokens", 8192) or 0),
                 audio_attachments=audio_attachments,
+                renderer_name=str(
+                    self._cfg("context_renderer", "xml_delta") or "xml_delta"
+                ),
             )
             req.conversation.token_usage = (
                 req.conversation.token_usage or 0

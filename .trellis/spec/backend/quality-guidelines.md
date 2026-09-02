@@ -17,9 +17,10 @@ context only and must not override the current SQLite lifecycle.
   boundary. Only `send_message`, `reply_message`, `react_message`, and `poke_user` may reach QQ. Keep
   ordinary `LLM_RESULT` content, reasoning, Provider errors, and internal tool status behind
   the send guard.
-- Keep renderer behavior deterministic. Every request uses the XML delta block renderer;
-  Core multi-role history remains in its original form while only the next SQLite Buffer suffix is
-  projected into one XML `user` block.
+- Keep renderer behavior deterministic. Every request uses the renderer selected by
+  `context.renderer` (`xml_delta` default, `line_messages` alternative); Core multi-role history
+  remains in its original form while only the next SQLite Buffer suffix is projected into one
+  `user` block.
 - Empty renderer input produces no user message. A stale or contentless snapshot stops in
   `OnLLMRequestEvent` before the Provider receives a request, and cursor updates remain
   monotonic across delayed runs.

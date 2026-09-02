@@ -44,6 +44,7 @@
 - `max_log_records`：每个群最多保留的待处理/进行中 Buffer 记录数（默认 10000）。设为 `0` 可禁用上限。
 - `max_text_chars`：单条消息存储的最大摘要长度（默认 4000）。
 - `record_self_messages`：是否记录机器人账号自己发的消息（默认关闭）。开启后，机器人回声事件可能进入后续快照并触发新一轮推理。
+- `astrbot_tool_blocklist`：在自主循环中**保留** AstrBot 注入的工具（联网搜索、知识库、只读文件等），仅剔除与快照/发送边界冲突的工具。默认剔除 `send_message_to_user`、`get_group_message_history`；可追加其他 AstrBot 工具名以拦截更多。
 - `renderer`：上下文渲染格式，可选 `xml_delta`（默认）或 `line_messages`。切换只影响后续新快照的渲染，已有会话历史保持原样。
 
 ### Prompt（提示词）

@@ -4,7 +4,6 @@ import pytest
 
 from response_policy import (
     classify_run_outcome,
-    enforce_tool_set,
     install_send_guard,
     isolate_platform_metadata,
     suppress_builtin_active_reply,
@@ -32,7 +31,9 @@ def test_suppress_direct_output_keeps_prior_tool_call_and_result_history():
     response = SimpleNamespace(completion_text="ordinary", result_chain=object())
     tool_call_assistant = SimpleNamespace(role="assistant", tool_calls=[object()])
     tool_result = SimpleNamespace(role="tool", tool_call_id="call-1")
-    terminal_assistant = SimpleNamespace(role="assistant", content="already sent by tool")
+    terminal_assistant = SimpleNamespace(
+        role="assistant", content="already sent by tool"
+    )
     run_context = SimpleNamespace(
         messages=[tool_call_assistant, tool_result, terminal_assistant]
     )
@@ -103,15 +104,6 @@ def test_isolate_platform_metadata_disables_core_proactive_tool_without_mutating
     assert event.platform_meta is not shared
     assert event.platform_meta.support_proactive_message is False
     assert shared.support_proactive_message is True
-
-
-def test_enforce_tool_set_replaces_tools_added_by_core_pipeline():
-    required = object()
-    request = SimpleNamespace(func_tool=object())
-
-    enforce_tool_set(request, required)
-
-    assert request.func_tool is required
 
 
 def test_suppress_builtin_active_reply_marks_event_as_already_directed():

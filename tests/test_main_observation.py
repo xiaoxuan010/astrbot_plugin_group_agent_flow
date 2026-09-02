@@ -6,6 +6,7 @@ import pytest
 
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import ImageURLPart, Message, TextPart
+from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_main_agent_resources import (
     TOOL_CALL_PROMPT,
     TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
@@ -53,6 +54,11 @@ class FakeEvent:
 
     def stop_event(self):
         self.stopped = True
+
+
+async def _noop(*_args, **_kwargs) -> None:
+    """占位 handler：用于在测试中构造工具对象。"""
+    return None
 
 
 def _record(message_id: str, text: str) -> dict:
@@ -394,21 +400,37 @@ async def test_clear_removes_sqlite_buffer_and_core_conversation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_enforce_autonomous_tools_builds_tools_for_current_event(monkeypatch):
+async def test_enforce_autonomous_tools_merges_and_filters_astrbot_tools():
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
-    plugin.tool_runtime = SimpleNamespace(build_tool_set=lambda _event: "tools")
-    event = FakeEvent({AUTONOMOUS_EXTRA: True})
-    request = ProviderRequest(prompt="review", contexts=[], func_tool="old")
-    event.set_extra("provider_request", request)
-    monkeypatch.setattr(
-        main_module,
-        "enforce_tool_set",
-        lambda req, tools: setattr(req, "func_tool", tools),
+    plugin.config = {
+        "context": {"astrbot_tool_blocklist": ["get_group_message_history"]}
+    }
+    gaf_tool = FunctionTool(
+        name="send_message",
+        description="Send one message to the current group.",
+        parameters={"type": "object", "properties": {}},
+        handler=_noop,
     )
+    plugin.tool_runtime = SimpleNamespace(
+        build_tool_set=lambda _event: ToolSet([gaf_tool])
+    )
+    event = FakeEvent({AUTONOMOUS_EXTRA: True})
+    request = ProviderRequest(prompt="review", contexts=[], func_tool=ToolSet())
+    request.func_tool.add_tool(
+        FunctionTool(
+            name="get_group_message_history",
+            description="Read persisted group history",
+            parameters={"type": "object", "properties": {}},
+            handler=_noop,
+        )
+    )
+    event.set_extra("provider_request", request)
 
     await plugin.enforce_autonomous_tools(event, None)
 
-    assert request.func_tool == "tools"
+    names = request.func_tool.names()
+    assert "send_message" in names
+    assert "get_group_message_history" not in names
 
 
 @pytest.mark.asyncio

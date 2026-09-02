@@ -59,6 +59,13 @@ Different Providers use that field for role-play replies or control statements s
 - `AGENT_PROTOCOL_PROMPT` requires every group-visible action or message to use an available
   external action tool. It does not enumerate tool names; `ToolRuntime.build_tool_set()` owns
   the model-visible names, descriptions, and argument schemas.
+- AstrBot-injected tools are preserved for autonomous runs instead of being fully replaced:
+  `merge_and_filter()` (in `tool_filter.py`) merges GAF's own tool set into the existing
+  `req.func_tool`, then removes AstrBot tools whose names are in the configured
+  `context.astrbot_tool_blocklist` (default: `send_message_to_user`, `get_group_message_history`).
+  GAF's own action tools never pass through the filter, so they cannot be blacklisted away;
+  same-name collisions resolve in favor of GAF via `ToolSet.add_tool`.
+  The old `enforce_tool_set` replace-all behavior is removed.
 - `OBSERVATION_CYCLE_PROMPT` repeats the immediate choice between an external action tool call
   and the no-argument `stay_silent` control tool.
 - `_system_prompt()` creates the plugin-owned prompt with optional custom text before

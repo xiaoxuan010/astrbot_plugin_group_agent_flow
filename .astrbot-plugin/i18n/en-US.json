@@ -46,6 +46,10 @@
         "description": "Record messages sent by the bot account",
         "hint": "Enabled bot echo events can enter later snapshots and start another reasoning cycle."
       },
+      "astrbot_tool_blocklist": {
+        "description": "AstrBot tools to exclude from the autonomous agent",
+        "hint": "Tools that conflict with the snapshot/send boundary are excluded by default; additional AstrBot tool names may be appended to block more."
+      },
       "renderer": {
         "description": "Context rendering format for snapshot observations",
         "hint": "XML Delta Block (Structured Components): single <group_messages_delta> with group metadata and structured event components. Line Messages: compact per-line format with [YYYY/MM/DD HH:MM] (QQ号)昵称: 正文 #message_id, token-efficient for long contexts.",

@@ -46,6 +46,10 @@
         "description": "记录机器人账号发送的消息",
         "hint": "启用后，机器人消息的回传事件可以进入后续快照并启动新的推理周期。"
       },
+      "astrbot_tool_blocklist": {
+        "description": "从自主智能体中排除的 AstrBot 工具",
+        "hint": "默认排除与快照/发送边界冲突的工具；可追加更多 AstrBot 工具名以拦截更多。"
+      },
       "renderer": {
         "description": "观察上下文渲染格式",
         "hint": "XML 增量块（结构化组件）：单个 <group_messages_delta>，外层携带群元数据，内部按 XML 组件表达事件。行式消息：每条消息一行，紧凑省略式 [YYYY/MM/DD HH:MM] (QQ号)昵称: 正文 #消息编号，长上下文更省 token。",

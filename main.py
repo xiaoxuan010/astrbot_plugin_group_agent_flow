@@ -42,7 +42,6 @@ from .qq_gateway import QQActionGateway
 from .response_policy import (
     EXTERNAL_ACTIONS_EXTRA,
     classify_run_outcome,
-    enforce_tool_set,
     install_send_guard,
     isolate_platform_metadata,
     suppress_builtin_active_reply,
@@ -53,6 +52,7 @@ from .store import (
     BufferCapacityError,
     GroupFlowStore,
 )
+from .tool_filter import merge_and_filter
 
 
 AUTONOMOUS_EXTRA = "_group_agent_autonomous"
@@ -131,6 +131,7 @@ CONFIG_PATHS = {
     "max_text_chars": ("context", "max_text_chars"),
     "record_self_messages": ("context", "record_self_messages"),
     "context_renderer": ("context", "renderer"),
+    "astrbot_tool_blocklist": ("context", "astrbot_tool_blocklist"),
     "custom_system_prompt": ("prompt", "custom_system_prompt"),
     "debug_log": ("debug", "debug_log"),
 }
@@ -147,6 +148,7 @@ CONFIG_DEFAULTS = {
     "max_text_chars": 4000,
     "record_self_messages": False,
     "context_renderer": "xml_delta",
+    "astrbot_tool_blocklist": ["send_message_to_user", "get_group_message_history"],
     "custom_system_prompt": "",
     "debug_log": False,
 }
@@ -584,7 +586,11 @@ class GroupAgentFlowPlugin(Star):
             return
         req.contexts = [*req.contexts, *prepared.contexts]
         req.audio_urls = list(prepared.audio_urls)
-        req.func_tool = self.tool_runtime.build_tool_set(event)
+        req.func_tool = merge_and_filter(
+            req.func_tool,
+            self.tool_runtime.build_tool_set(event),
+            self._cfg("astrbot_tool_blocklist", []),
+        )
         if bool(self._cfg("debug_log", False)):
             logger.debug(
                 f"[{PLUGIN_NAME}] prepared batch "
@@ -668,7 +674,11 @@ class GroupAgentFlowPlugin(Star):
         event.set_extra(RUN_CONTEXT_EXTRA, run_context)
         request = event.get_extra("provider_request")
         if isinstance(request, ProviderRequest):
-            enforce_tool_set(request, self.tool_runtime.build_tool_set(event))
+            request.func_tool = merge_and_filter(
+                request.func_tool,
+                self.tool_runtime.build_tool_set(event),
+                self._cfg("astrbot_tool_blocklist", []),
+            )
 
     @filter.on_agent_done(priority=-maxsize + 20)
     async def remove_direct_output_from_history(

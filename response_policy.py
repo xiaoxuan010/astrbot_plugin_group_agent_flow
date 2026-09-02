@@ -81,11 +81,6 @@ def suppress_builtin_active_reply(event: Any) -> None:
     event.is_at_or_wake_command = True
 
 
-def enforce_tool_set(request: Any, tool_set: Any) -> None:
-    """替换 AstrBot 在请求装饰阶段可能追加的全局工具。"""
-    request.func_tool = tool_set
-
-
 def isolate_platform_metadata(event: Any) -> None:
     """在事件私有的元数据副本上禁用 AstrBot 额外主动发送工具。"""
     metadata = copy.copy(event.platform_meta)

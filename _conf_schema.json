@@ -70,6 +70,13 @@
         "hint": "Enabled bot echo events can enter later snapshots and start another reasoning cycle.",
         "default": false
       },
+      "astrbot_tool_blocklist": {
+        "type": "list",
+        "description": "AstrBot tools to exclude from the autonomous agent",
+        "hint": "Tools that conflict with the snapshot/send boundary are excluded by default; additional AstrBot tool names may be appended to block more.",
+        "items": {"type": "string"},
+        "default": ["send_message_to_user", "get_group_message_history"]
+      },
       "renderer": {
         "type": "string",
         "description": "Context rendering format for snapshot observations",

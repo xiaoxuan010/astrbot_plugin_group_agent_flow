@@ -15,6 +15,10 @@
   or config; `build_renderer(name)` falls back to the XML delta renderer for unknown names.
 - `agent_tools.py` defines the model-visible tool schemas and explicit termination policy.
   `qq_gateway.py` contains QQ/AstrBot side effects.
+- `tool_filter.py` owns the merge-and-blocklist behavior for AstrBot-injected tools:
+  `merge_and_filter()` merges GAF's own tool set into the existing `req.func_tool` and removes
+  AstrBot tools named in `context.astrbot_tool_blocklist`. GAF action tools never pass through
+  the filter and resolve same-name collisions in GAF's favor via `ToolSet.add_tool`.
 - `response_policy.py` owns the controlled platform boundary: it blocks ordinary model content,
   reasoning, Provider errors, and internal tool status while preserving the original sender
   exclusively for QQ action tools.

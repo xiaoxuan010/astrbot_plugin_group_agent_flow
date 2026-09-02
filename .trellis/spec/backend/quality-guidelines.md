@@ -17,6 +17,12 @@ context only and must not override the current SQLite lifecycle.
   boundary. Only `send_message`, `reply_message`, `react_message`, and `poke_user` may reach QQ. Keep
   ordinary `LLM_RESULT` content, reasoning, Provider errors, and internal tool status behind
   the send guard.
+- Preserve AstrBot-injected tools for autonomous runs through `merge_and_filter()` in
+  `tool_filter.py`: merge GAF's own tool set into the existing `req.func_tool`, then remove
+  AstrBot tools named in `context.astrbot_tool_blocklist` (default `send_message_to_user`,
+  `get_group_message_history`). GAF action tools never pass through the filter and win
+  same-name collisions via `ToolSet.add_tool`. Tests must assert GAF tools survive even when
+  their names appear in a custom blocklist.
 - Keep renderer behavior deterministic. Every request uses the renderer selected by
   `context.renderer` (`xml_delta` default, `line_messages` alternative); Core multi-role history
   remains in its original form while only the next SQLite Buffer suffix is projected into one

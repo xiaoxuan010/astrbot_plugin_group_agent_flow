@@ -46,10 +46,6 @@
         "description": "Record messages sent by the bot account",
         "hint": "Enabled bot echo events can enter later snapshots and start another reasoning cycle."
       },
-      "record_empty_messages": {
-        "description": "Legacy compatibility flag for contentless-event diagnostics",
-        "hint": "Contentless transport events are never written to the SQLite Buffer or sent to the model."
-      },
       "renderer": {
         "description": "Context rendering format for snapshot observations",
         "hint": "XML Delta Block (Structured Components): single <group_messages_delta> with group metadata and structured event components. Line Messages: compact per-line format with [YYYY/MM/DD HH:MM] (QQ号)昵称: 正文 #message_id, token-efficient for long contexts.",

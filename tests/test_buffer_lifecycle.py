@@ -241,10 +241,10 @@ def test_reconcile_acks_checkpoint_and_requeues_missing_checkpoint(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_empty_event_is_not_written_even_when_legacy_flag_is_true(monkeypatch):
+async def test_empty_event_is_not_written(monkeypatch):
     flow_id = "qq:group:1"
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
-    plugin.config = {"context": {"record_empty_messages": True}}
+    plugin.config = {}
     plugin._locks = {}
     writes = []
     plugin.store = SimpleNamespace(

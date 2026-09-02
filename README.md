@@ -44,7 +44,6 @@
 - `max_log_records`：每个群最多保留的待处理/进行中 Buffer 记录数（默认 10000）。设为 `0` 可禁用上限。
 - `max_text_chars`：单条消息存储的最大摘要长度（默认 4000）。
 - `record_self_messages`：是否记录机器人账号自己发的消息（默认关闭）。开启后，机器人回声事件可能进入后续快照并触发新一轮推理。
-- `record_empty_messages`：无内容事件的旧配置兼容项（默认开启）。无内容传输事件不会写入 Buffer，也不会发给模型。
 - `renderer`：上下文渲染格式，可选 `xml_delta`（默认）或 `line_messages`。切换只影响后续新快照的渲染，已有会话历史保持原样。
 
 ### Prompt（提示词）

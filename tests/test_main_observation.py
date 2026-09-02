@@ -278,7 +278,7 @@ async def test_record_schedules_inserted_message_while_holding_flow_lock(monkeyp
 async def test_contentless_event_never_reaches_store(monkeypatch):
     flow_id = "qq:group:1"
     plugin = GroupAgentFlowPlugin.__new__(GroupAgentFlowPlugin)
-    plugin.config = {"context": {"record_empty_messages": True}}
+    plugin.config = {}
     plugin._locks = {}
     writes = []
     plugin.store = SimpleNamespace(

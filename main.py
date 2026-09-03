@@ -307,10 +307,36 @@ class GroupAgentFlowPlugin(Star):
         return bool(group_id and (group_id in allowed or "*" in allowed))
 
     @staticmethod
+    def _collect_plugin_command_names() -> set[str]:
+        """从全局命令注册表动态收集所有插件命令名。
+
+        遍历所有已注册 Handler 的 event_filters，提取具备
+        ``get_complete_command_names()`` 的命令过滤器（CommandFilter）的完整命令名。
+        这样凡是注册为 ``@filter.command`` 的命令都会自动被识别，无需硬编码。
+        """
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry
+
+            names: set[str] = set()
+            for handler in star_handlers_registry._handlers:
+                for filter_ in getattr(handler, "event_filters", []) or []:
+                    getter = getattr(filter_, "get_complete_command_names", None)
+                    if callable(getter):
+                        names.update(filter_.get_complete_command_names())
+            return {n.lstrip("/").lower() for n in names}
+        except Exception:
+            # 注册表不可用时回退到本插件已知命令，保证不破坏现有行为。
+            return {"gaf_status", "gaf_clear"}
+
+    @staticmethod
     def _is_plugin_command(event: AstrMessageEvent) -> bool:
-        """识别运维命令，避免将其送入自主观察循环。"""
+        """识别插件命令，避免将其送入自主观察循环。
+
+        命令一旦通过 ``@filter.command`` 注册（如 /compact），就应被视为插件命令，
+        不再进入 GAF 的自主观察流程。命令集合动态取自全局注册表，无需硬编码。
+        """
         command = str(event.get_message_str() or "").strip().split(" ", 1)[0]
-        return command.lstrip("/") in {"gaf_status", "gaf_clear"}
+        return command.lstrip("/").lower() in GroupAgentFlowPlugin._collect_plugin_command_names()
 
     async def _record(
         self,

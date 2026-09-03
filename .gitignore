@@ -3,6 +3,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 .pytest_cache/
+.pytest-tmp/
 .venv/
 dist/
 build/

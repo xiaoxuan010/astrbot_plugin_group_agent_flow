@@ -29,7 +29,8 @@ BATCH_ID_EXTRA = "_group_agent_batch_id"
 BATCH_RECORDS_EXTRA = "_group_agent_batch_records"
 CHECKPOINT_ID_EXTRA = "_group_agent_checkpoint_id"
 MESSAGE_ID_DESCRIPTION = (
-    'Exact message ID from the message_id="..." XML attribute in the observed context.'
+    'Exact message ID from the message_id="..." XML attribute in the observed '
+    'context. The # prefix displayed after line-format messages is also accepted.'
 )
 
 
@@ -82,9 +83,17 @@ class ToolRuntime:
         batch_id: str = "",
     ) -> dict[str, Any] | None:
         """仅当消息属于冻结快照时返回其记录。"""
-        return self.store.get_message(
+        record = self.store.get_message(
             flow_id,
             message_id,
+            snapshot_seq=snapshot_seq,
+            batch_id=batch_id or None,
+        )
+        if record is not None or not str(message_id).startswith("#"):
+            return record
+        return self.store.get_message(
+            flow_id,
+            str(message_id)[1:],
             snapshot_seq=snapshot_seq,
             batch_id=batch_id or None,
         )
@@ -309,15 +318,13 @@ class ToolRuntime:
             """仅引用回复当前快照中可见的消息。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
-            if (
-                self._target_message_in_snapshot(
-                    flow_id,
-                    message_id,
-                    snapshot_seq,
-                    batch_id,
-                )
-                is None
-            ):
+            record = self._target_message_in_snapshot(
+                flow_id,
+                message_id,
+                snapshot_seq,
+                batch_id,
+            )
+            if record is None:
                 return _json(
                     {
                         "success": False,
@@ -330,7 +337,7 @@ class ToolRuntime:
                 "reply_message",
                 lambda: self.gateway.reply_message(
                     event,
-                    message_id=message_id,
+                    message_id=str(record["message_id"]),
                     content=content,
                     mentions=mentions or [],
                 ),
@@ -340,15 +347,13 @@ class ToolRuntime:
             """仅对当前快照中可见的消息添加表情回应。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
-            if (
-                self._target_message_in_snapshot(
-                    flow_id,
-                    message_id,
-                    snapshot_seq,
-                    batch_id,
-                )
-                is None
-            ):
+            record = self._target_message_in_snapshot(
+                flow_id,
+                message_id,
+                snapshot_seq,
+                batch_id,
+            )
+            if record is None:
                 return _json(
                     {
                         "success": False,
@@ -360,7 +365,7 @@ class ToolRuntime:
                 event,
                 "react_message",
                 lambda: self.gateway.react_message(
-                    event, message_id=message_id, reaction=reaction
+                    event, message_id=str(record["message_id"]), reaction=reaction
                 ),
             )
 

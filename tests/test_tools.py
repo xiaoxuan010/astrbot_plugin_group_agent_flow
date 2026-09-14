@@ -783,6 +783,41 @@ async def test_multiple_external_actions_execute_in_one_run(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_message_tools_accept_line_format_message_id_prefix(tmp_path):
+    store = GroupFlowStore(tmp_path)
+    store.append_record(
+        "napcat:group:1",
+        {"message_id": "1193656264", "sender_id": "alice", "text": "hello"},
+    )
+    event = FakeEvent()
+    tools = ToolRuntime(store, QQActionGateway()).build_tool_set()
+
+    message = json.loads(
+        await tools.get_tool("get_message").handler(event, message_id="#1193656264")
+    )
+    reply = await tools.get_tool("reply_message").handler(
+        event,
+        message_id="#1193656264",
+        content="收到",
+    )
+    await tools.get_tool("react_message").handler(
+        event,
+        message_id="#1193656264",
+        reaction="赞",
+    )
+
+    assert message["message_id"] == "1193656264"
+    assert reply == '{"success":true,"action":"reply_message"}'
+    assert event.bot.actions == [
+        (
+            "set_msg_emoji_like",
+            {"message_id": "1193656264", "emoji_id": "76", "set": True},
+        )
+    ]
+    assert str(event.sent[0].chain[0].id) == "1193656264"
+
+
+@pytest.mark.asyncio
 async def test_external_message_tool_returns_structured_result_without_finalizing(
     tmp_path,
 ):

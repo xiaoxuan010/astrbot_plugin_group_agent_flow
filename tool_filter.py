@@ -29,7 +29,7 @@ def filter_astrbot_tools(
         tool_set: AstrBot ``ToolSet`` 实例（具备 ``names()`` / ``remove_tool()``）。
         blocklist: 需要剔除的工具名集合；为 ``None`` 时使用 ``DEFAULT_BLOCKLIST``。
     """
-    effective = set(blocklist) if blocklist else set(DEFAULT_BLOCKLIST)
+    effective = set(DEFAULT_BLOCKLIST if blocklist is None else blocklist)
     if not effective:
         return
     names = getattr(tool_set, "names", None)

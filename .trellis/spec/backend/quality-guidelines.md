@@ -22,7 +22,8 @@ context only and must not override the current SQLite lifecycle.
   AstrBot tools named in `context.astrbot_tool_blocklist` (default `send_message_to_user`,
   `get_group_message_history`). GAF action tools never pass through the filter and win
   same-name collisions via `ToolSet.add_tool`. Tests must assert GAF tools survive even when
-  their names appear in a custom blocklist.
+  their names appear in a custom blocklist. An explicit empty list disables filtering;
+  only `None` selects the default blocklist.
 - Keep renderer behavior deterministic. Every request uses the renderer selected by
   `context.renderer` (`xml_delta` default, `line_messages` alternative); Core multi-role history
   remains in its original form while only the next SQLite Buffer suffix is projected into one

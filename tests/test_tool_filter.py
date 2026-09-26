@@ -60,11 +60,11 @@ def test_filter_respects_custom_blocklist():
 
 
 def test_filter_with_empty_blocklist_keeps_all():
-    tool_set = ToolSet([_tool("web_search_tavily"), _tool("astr_kb_search")])
+    tool_set = ToolSet([_tool("send_message_to_user"), _tool("web_search_tavily")])
 
     filter_astrbot_tools(tool_set, [])
 
-    assert tool_set.names() == ["web_search_tavily", "astr_kb_search"]
+    assert tool_set.names() == ["send_message_to_user", "web_search_tavily"]
 
 
 def test_merge_and_filter_combines_astrbot_and_gaf_tools():

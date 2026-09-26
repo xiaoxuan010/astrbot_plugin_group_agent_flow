@@ -38,3 +38,37 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: 完成 AstrBot 工具黑名单任务
+
+**Date**: 2026-09-27
+**Task**: 完成 AstrBot 工具黑名单任务
+**Branch**: `main`
+
+### Summary
+
+修复显式空黑名单的过滤语义；154 项测试通过，任务已归档；保留消息 ID 的两处未提交改动供后续处理。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b17e109` | (see git log) |
+| `fc6b7c0` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

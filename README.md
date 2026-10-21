@@ -12,7 +12,7 @@
 
 ## 安装
 
-本插件依赖 AstrBot `>= 4.27.4`，支持 aiocqhttp / NapCat 平台。
+本插件依赖 AstrBot `>= 4.29.0`，支持 aiocqhttp / NapCat 平台。
 
 将本仓库放入 AstrBot 的插件目录后重载插件即可。
 
@@ -70,8 +70,10 @@
 
 如需让 Agent 理解图片：
 
-- 对话模型声明 `image` 模态时，插件可按需读取原图；
+- 对话模型声明 `image` 模态时，插件可按需读取经过 AstrBot 统一预处理的图片；
 - 模型不支持输入图片时，在 AstrBot 中配置 `默认图片转述模型`，由视觉 Provider 提供图片转述。
+
+图片读取和图片转述均复用 AstrBot 的 `prepare_model_image`，沿用当前会话的 `provider_settings.image_compress_options.max_size` 配置。静图按需缩放、转换格式，动图转换为九宫格预览，提供给模型的单张图片严格小于 512 KiB。原图保留，生成的预览文件在事件结束时清理。
 
 ## 群内管理指令
 

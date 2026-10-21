@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 from astrbot.core.agent.tool import FunctionTool, ToolSet
-from astrbot.core.utils.media_utils import resolve_image_ref_to_base64_data
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+from astrbot.core.utils.media_utils import (
+    normalize_model_image_max_size,
+    prepare_model_image,
+    resolve_image_ref_to_base64_data,
+)
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 try:
@@ -30,7 +36,7 @@ BATCH_RECORDS_EXTRA = "_group_agent_batch_records"
 CHECKPOINT_ID_EXTRA = "_group_agent_checkpoint_id"
 MESSAGE_ID_DESCRIPTION = (
     'Exact message ID from the message_id="..." XML attribute in the observed '
-    'context. The # prefix displayed after line-format messages is also accepted.'
+    "context. The # prefix displayed after line-format messages is also accepted."
 )
 
 
@@ -200,6 +206,36 @@ class ToolRuntime:
             if image_ref:
                 refs.append(image_ref)
         return refs
+
+    async def _prepare_image_refs(self, event: Any, image_refs: list[str]) -> list[str]:
+        """Prepare tool images with AstrBot's current-session image policy.
+
+        Args:
+            event: Event that owns generated previews until the run ends.
+            image_refs: Source references in message component order.
+
+        Returns:
+            Model-ready local image paths in the same order.
+
+        Raises:
+            ValueError: AstrBot cannot prepare a source image.
+        """
+        config = self.context.get_config(umo=event.unified_msg_origin)
+        options = config.get("provider_settings", {}).get("image_compress_options", {})
+        max_size = normalize_model_image_max_size(options.get("max_size"))
+        output_dir = Path(get_astrbot_temp_path())
+        prepared_refs = []
+        for image_ref in image_refs:
+            prepared = await prepare_model_image(
+                image_ref, max_size=max_size, output_dir=output_dir
+            )
+            if prepared is None:
+                raise ValueError("image reference could not be prepared")
+            path, _, needs_cleanup, _ = prepared
+            if needs_cleanup:
+                event.track_temporary_local_file(path)
+            prepared_refs.append(path)
+        return prepared_refs
 
     @staticmethod
     def _message_voice_refs(record: dict[str, Any]) -> list[str]:
@@ -417,7 +453,7 @@ class ToolRuntime:
         async def get_message_images(
             event: Any, message_id: str
         ) -> str | CallToolResult:
-            """读取一条快照消息中的原图。"""
+            """读取经过 AstrBot 图片预处理的快照消息图片。"""
             _, flow_id, snapshot_seq, _ = self._run_metadata(event)
             batch_id = str(event.get_extra(BATCH_ID_EXTRA, "") or "")
             record = self._message_in_snapshot(
@@ -468,7 +504,8 @@ class ToolRuntime:
                         text=_json(metadata),
                     )
                 ]
-                for image_ref in image_refs:
+                prepared_refs = await self._prepare_image_refs(event, image_refs)
+                for image_ref in prepared_refs:
                     resolved = await resolve_image_ref_to_base64_data(
                         image_ref,
                         strict=True,
@@ -562,9 +599,10 @@ class ToolRuntime:
                 provider = self.context.get_provider_by_id(provider_id)
                 if provider is None:
                     raise ValueError("image caption provider unavailable")
+                prepared_refs = await self._prepare_image_refs(event, image_refs)
                 response = await provider.text_chat(
                     prompt=prompt,
-                    image_urls=image_refs,
+                    image_urls=prepared_refs,
                 )
                 caption = str(getattr(response, "completion_text", "") or "").strip()
                 if not caption:

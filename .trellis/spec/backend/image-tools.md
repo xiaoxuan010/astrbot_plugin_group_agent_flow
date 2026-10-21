@@ -1,11 +1,11 @@
 # Image Tool Contracts
 
-## Scenario: Read original images or captions from a frozen snapshot
+## Scenario: Read prepared images or captions from a frozen snapshot
 
 ### 1. Scope / Trigger
 
 Apply this contract when adding or changing model tools that read image components from the
-plugin JSONL observation log. It keeps original image tokens within explicitly multimodal
+plugin observation Buffer. It keeps image tokens within explicitly multimodal
 Providers and gives every other Provider a text-caption path.
 
 ### 2. Signatures
@@ -15,9 +15,10 @@ Providers and gives every other Provider a text-caption path.
 - Model tool: `get_message_images(message_id: str) -> CallToolResult | str`
 - Model tool: `get_image_captions(message_id: str) -> str`
 - Core media boundary:
+  `prepare_model_image(ref, max_size=..., output_dir=...) -> tuple[str, bool, bool, str] | None`
   `resolve_image_ref_to_base64_data(ref, strict=True) -> ResolvedImageData | None`
 - Caption boundary:
-  `Provider.text_chat(prompt=caption_prompt, image_urls=image_refs) -> LLMResponse`
+  `Provider.text_chat(prompt=caption_prompt, image_urls=prepared_refs) -> LLMResponse`
 
 ### 3. Contracts
 
@@ -47,8 +48,15 @@ Providers and gives every other Provider a text-caption path.
 - `get_image_captions` reads
   `provider_settings.default_image_caption_provider_id` and `image_caption_prompt` through
   `Context.get_config(umo=event.unified_msg_origin)`.
+- Both image tools call Core's `prepare_model_image` before sending image content to a Provider.
+  They read `provider_settings.image_compress_options.max_size` from the current session's
+  `Context.get_config(umo=event.unified_msg_origin)` and normalize it with Core's
+  `normalize_model_image_max_size`. Core owns still-image conversion, animation montages,
+  input limits, and the strict output limit below 512 KiB; the plugin has no separate encoder.
+- Generated previews are registered with `event.track_temporary_local_file` only when Core's
+  `needs_cleanup` flag is true. Reused originals are retained.
 - `get_message_images` returns one `TextContent` metadata item followed by one `ImageContent`
-  per image. Each image contains raw base64 data and the MIME type resolved by AstrBot Core.
+  per image. Each image contains base64 data from the prepared file and its Core-resolved MIME type.
 - `get_image_captions` passes all images from one message to one dedicated Provider call and
   returns `{"message_id":"...","caption":"..."}`.
 - `main.py` passes the current event at the direct request, `on_llm_request`, and
@@ -58,7 +66,7 @@ Providers and gives every other Provider a text-caption path.
 
 - Missing or post-snapshot message -> `message_not_found_in_snapshot`.
 - Message with zero valid image components -> `message_contains_no_images`.
-- Core media resolution failure -> `image_unavailable`.
+- Core image preparation or media resolution failure -> `image_unavailable`.
 - Missing caption context or `default_image_caption_provider_id` ->
   `image_caption_provider_unconfigured`.
 - Caption configuration lookup failure -> `image_caption_failed`.
@@ -69,7 +77,7 @@ Providers and gives every other Provider a text-caption path.
 ### 5. Good/Base/Bad Cases
 
 - Good: a Provider declaring `["text", "image", "tool_use"]` receives only
-  `get_message_images`, whose raw image result contains Core-compatible `ImageContent`.
+  `get_message_images`, whose prepared image result contains Core-compatible `ImageContent`.
 - Base: a text-only Provider receives `get_image_captions`, which uses the configured visual
   Provider and returns one merged caption.
 - Bad: an absent `modalities` field exposes raw images or a future message bypasses
@@ -79,15 +87,15 @@ Providers and gives every other Provider a text-caption path.
 
 - Tool-set tests cover explicit image support, text-only, empty, missing, and non-list
   `modalities`; assert that each Provider receives exactly one image-reading tool.
-- Event-codec tests assert raw OneBot image URLs remain aligned with image components. Raw-image
-  tests assert `source_url` takes precedence over an expired local path, ordered resolver calls
-  with `strict=True`, NapCat refresh after expiry, metadata count, MIME types, `ImageContent`,
+- Event-codec tests assert raw OneBot image URLs remain aligned with image components. Image-tool
+  tests assert `source_url` takes precedence over an expired local path, prepared image order,
+  current-session size settings, preview cleanup, NapCat refresh after expiry, metadata count, MIME types, `ImageContent`,
   future-message rejection, no-image rejection, and compact resolution errors.
 - History-tool tests assert that `source_url` remains available to image readers but never appears
   in model-visible message or history-search results.
 - Gateway tests cover direct `get_msg` refresh and the `message_seq`-anchored group-history
   fallback.
-- Caption tests assert the dedicated Provider ID, prompt, ordered `image_urls`, merged caption,
+- Caption tests assert the dedicated Provider ID, prompt, ordered prepared `image_urls`, merged caption,
   unconfigured Provider error, Provider failure, and absence of URL or exception leakage.
 - Main-hook tests assert all three tool-set construction paths pass the current event.
 - Full-suite checks include pytest, Ruff, compileall, package import, and `git diff --check`.
@@ -158,7 +166,7 @@ image data.
 ### 5. Good / Base / Bad Cases
 
 - Good: the image tool returns a caption plus `ImageContent`; later calls in the same loop see
-  the original image; after `stay_silent`, history holds caption metadata and compacted text only.
+  the prepared image; after `stay_silent`, history holds caption metadata and compacted text only.
 - Base: no caption Provider is configured; the current loop can still inspect the image, then
   history keeps only the compacted text notice.
 - Bad: compacting in `on_agent_done` only; `stay_silent` reaches Core history with raw image data.
